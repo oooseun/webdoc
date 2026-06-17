@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Generated sites / runtime artifacts
+*/server.json
+*/feedback.jsonl
+sites/
+report_site/
+
+# OS
+.DS_Store

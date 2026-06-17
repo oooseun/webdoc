@@ -1,0 +1,4 @@
+interface:
+  display_name: "Webdoc"
+  short_description: "Local websites for docs and feedback"
+  default_prompt: "Use $webdoc to turn this report into a local website with persistent feedback."

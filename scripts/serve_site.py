@@ -1,0 +1,369 @@
+#!/usr/bin/env python3
+"""Manage a loopback-only static server for generated webdoc sites."""
+
+from __future__ import annotations
+
+import argparse
+import functools
+import http.server
+import json
+import os
+import signal
+import subprocess
+import sys
+import threading
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from socketserver import ThreadingMixIn
+from urllib.parse import urlparse
+
+
+DEFAULT_ROOT = Path(os.environ.get("AGENT_ARTIFACT_SITES", "~/agent-artifacts/sites")).expanduser()
+DEFAULT_TTL_SECONDS = 4 * 60 * 60
+MAX_FEEDBACK_BYTES = 64 * 1024
+FEEDBACK_LOCK = threading.Lock()
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def resolve_site(value: str | Path) -> Path:
+    candidate = Path(value).expanduser()
+    if candidate.exists():
+        return candidate.resolve()
+    by_id = DEFAULT_ROOT / str(value)
+    return by_id.resolve()
+
+
+def server_json(site_dir: Path) -> Path:
+    return site_dir / "server.json"
+
+
+def feedback_jsonl(site_dir: Path) -> Path:
+    return site_dir / "feedback.jsonl"
+
+
+def pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def load_server_info(site_dir: Path) -> dict[str, object] | None:
+    path = server_json(site_dir)
+    if not path.exists():
+        return None
+    try:
+        info = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return None
+    return info if isinstance(info, dict) else None
+
+
+def validate_site(site_dir: Path, allow_symlinks: bool = False) -> None:
+    if not site_dir.exists() or not site_dir.is_dir():
+        raise SystemExit(f"site directory not found: {site_dir}")
+    if not (site_dir / "index.html").exists():
+        raise SystemExit(f"index.html not found in: {site_dir}")
+    if not allow_symlinks:
+        for item in site_dir.rglob("*"):
+            if item.is_symlink():
+                raise SystemExit(f"refusing to serve symlink inside site directory: {item}")
+
+
+class NoListingHandler(http.server.SimpleHTTPRequestHandler):
+    def site_dir(self) -> Path:
+        return Path(self.directory).resolve()
+
+    def send_json(self, status: int, payload: dict[str, object]) -> None:
+        body = json.dumps(payload, indent=2, sort_keys=True).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self) -> None:
+        parsed = urlparse(self.path)
+        if parsed.path == "/api/health":
+            self.send_json(200, {"ok": True, "site_dir": str(self.site_dir())})
+            return
+        if parsed.path == "/api/feedback":
+            entries: list[object] = []
+            path = feedback_jsonl(self.site_dir())
+            if path.exists():
+                for line in path.read_text(encoding="utf-8").splitlines():
+                    if not line.strip():
+                        continue
+                    try:
+                        entries.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        entries.append({"error": "bad_feedback_line", "raw": line})
+            self.send_json(200, {"feedback_path": str(path), "entries": entries})
+            return
+        super().do_GET()
+
+    def do_POST(self) -> None:
+        parsed = urlparse(self.path)
+        if parsed.path != "/api/feedback":
+            self.send_json(404, {"error": "not_found"})
+            return
+        try:
+            length = int(self.headers.get("content-length", "0"))
+        except ValueError:
+            self.send_json(400, {"error": "bad_content_length"})
+            return
+        if length <= 0:
+            self.send_json(400, {"error": "empty_body"})
+            return
+        if length > MAX_FEEDBACK_BYTES:
+            self.send_json(413, {"error": "feedback_too_large", "limit_bytes": MAX_FEEDBACK_BYTES})
+            return
+        try:
+            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+        except json.JSONDecodeError:
+            self.send_json(400, {"error": "bad_json"})
+            return
+        feedback = str(payload.get("feedback", "")).strip()
+        if not feedback:
+            self.send_json(400, {"error": "empty_feedback"})
+            return
+        entry = {
+            "received_at": now_iso(),
+            "artifact_id": str(payload.get("artifact_id", ""))[:160],
+            "page": str(payload.get("page", ""))[:300],
+            "feedback": feedback,
+            "user_agent": self.headers.get("user-agent", "")[:300],
+        }
+        path = feedback_jsonl(self.site_dir())
+        with FEEDBACK_LOCK:
+            with path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, sort_keys=True) + "\n")
+        self.send_json(200, {"ok": True, "feedback_path": str(path), "received_at": entry["received_at"]})
+
+    def list_directory(self, path: str):  # type: ignore[override]
+        self.send_error(403, "Directory listing disabled")
+        return None
+
+    def end_headers(self) -> None:
+        self.send_header("Cache-Control", "no-store")
+        super().end_headers()
+
+    def log_message(self, fmt: str, *args: object) -> None:
+        sys.stderr.write("[%s] %s\n" % (datetime.now().isoformat(timespec="seconds"), fmt % args))
+
+
+class ThreadingHTTPServer(ThreadingMixIn, http.server.HTTPServer):
+    daemon_threads = True
+
+
+def run_server(site_dir: Path, host: str, port: int, ttl: int) -> int:
+    validate_site(site_dir)
+    handler = functools.partial(NoListingHandler, directory=str(site_dir))
+    httpd = ThreadingHTTPServer((host, port), handler)
+    actual_port = int(httpd.server_address[1])
+    pid = os.getpid()
+    info = {
+        "pid": pid,
+        "host": host,
+        "port": actual_port,
+        "url": f"http://{host}:{actual_port}/",
+        "site_dir": str(site_dir),
+        "started_at": now_iso(),
+        "ttl_seconds": ttl,
+        "command": " ".join(sys.argv),
+        "manager": "webdoc/serve_site.py",
+    }
+    server_json(site_dir).write_text(json.dumps(info, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    def shutdown(signum: int, frame: object) -> None:
+        threading.Thread(target=httpd.shutdown, daemon=True).start()
+
+    signal.signal(signal.SIGTERM, shutdown)
+    signal.signal(signal.SIGINT, shutdown)
+
+    if ttl > 0:
+        deadline = time.monotonic() + ttl
+
+        def ttl_loop() -> None:
+            while time.monotonic() < deadline:
+                time.sleep(min(5, max(0.1, deadline - time.monotonic())))
+            httpd.shutdown()
+
+        threading.Thread(target=ttl_loop, daemon=True).start()
+
+    try:
+        httpd.serve_forever(poll_interval=0.5)
+    finally:
+        httpd.server_close()
+        info["stopped_at"] = now_iso()
+        try:
+            server_json(site_dir).write_text(json.dumps(info, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        except OSError:
+            pass
+    return 0
+
+
+def start(site_dir: Path, host: str, port: int, ttl: int, allow_lan: bool, allow_symlinks: bool) -> int:
+    if host not in {"127.0.0.1", "localhost", "::1"} and not allow_lan:
+        raise SystemExit("refusing non-loopback host without --allow-lan")
+    validate_site(site_dir, allow_symlinks=allow_symlinks)
+    info = load_server_info(site_dir)
+    if info and pid_alive(int(info.get("pid", -1))) and str(info.get("site_dir")) == str(site_dir):
+        print(json.dumps(info, indent=2, sort_keys=True))
+        return 0
+
+    try:
+        server_json(site_dir).unlink()
+    except FileNotFoundError:
+        pass
+
+    log = (site_dir / "server.log").open("ab")
+    cmd = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "run-server",
+        str(site_dir),
+        "--host",
+        host,
+        "--port",
+        str(port),
+        "--ttl",
+        str(ttl),
+    ]
+    child = subprocess.Popen(
+        cmd,
+        stdout=log,
+        stderr=log,
+        stdin=subprocess.DEVNULL,
+        start_new_session=True,
+        close_fds=True,
+    )
+
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        info = load_server_info(site_dir)
+        if info and int(info.get("pid", -1)) == child.pid:
+            print(json.dumps(info, indent=2, sort_keys=True))
+            return 0
+        if child.poll() is not None:
+            raise SystemExit(f"server failed to start; see {site_dir / 'server.log'}")
+        time.sleep(0.1)
+    raise SystemExit(f"server did not report readiness; see {site_dir / 'server.log'}")
+
+
+def stop(site_dir: Path, quiet: bool = False) -> int:
+    info = load_server_info(site_dir)
+    if not info:
+        if not quiet:
+            print(json.dumps({"status": "not-running", "site_dir": str(site_dir)}, indent=2))
+        return 0
+    pid = int(info.get("pid", -1))
+    if not pid_alive(pid):
+        if not quiet:
+            print(json.dumps({"status": "stale", "pid": pid, "site_dir": str(site_dir)}, indent=2))
+        return 0
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    except PermissionError as exc:
+        raise SystemExit(f"permission denied stopping pid {pid}: {exc}") from exc
+
+    deadline = time.time() + 5
+    while time.time() < deadline and pid_alive(pid):
+        time.sleep(0.1)
+    status = "stopped" if not pid_alive(pid) else "stop-timeout"
+    if not quiet:
+        print(json.dumps({"status": status, "pid": pid, "site_dir": str(site_dir)}, indent=2))
+    return 0 if status == "stopped" else 1
+
+
+def status(site_dir: Path) -> int:
+    info = load_server_info(site_dir)
+    if not info:
+        print(json.dumps({"status": "not-running", "site_dir": str(site_dir)}, indent=2))
+        return 0
+    pid = int(info.get("pid", -1))
+    alive = pid_alive(pid)
+    if alive:
+        info["status"] = "running"
+    elif info.get("stopped_at"):
+        info["status"] = "stopped"
+    else:
+        info["status"] = "stale"
+    print(json.dumps(info, indent=2, sort_keys=True))
+    return 0
+
+
+def cleanup(root: Path, stop_running: bool = False) -> int:
+    root = root.expanduser().resolve()
+    results: list[dict[str, object]] = []
+    for path in root.glob("*/server.json"):
+        site_dir = path.parent
+        info = load_server_info(site_dir)
+        if not info:
+            continue
+        pid = int(info.get("pid", -1))
+        alive = pid_alive(pid)
+        if alive and stop_running:
+            code = stop(site_dir, quiet=True)
+            alive = code != 0
+        results.append({"site_dir": str(site_dir), "pid": pid, "alive": alive})
+    print(json.dumps({"root": str(root), "servers": results}, indent=2, sort_keys=True))
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Manage localhost static preview servers for webdoc sites.")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_start = sub.add_parser("start", help="Start serving a site directory")
+    p_start.add_argument("site")
+    p_start.add_argument("--host", default="127.0.0.1")
+    p_start.add_argument("--port", type=int, default=0, help="0 lets the OS choose an unused port")
+    p_start.add_argument("--ttl", type=int, default=DEFAULT_TTL_SECONDS, help="Seconds before auto-shutdown; 0 disables TTL")
+    p_start.add_argument("--allow-lan", action="store_true")
+    p_start.add_argument("--allow-symlinks", action="store_true")
+
+    p_stop = sub.add_parser("stop", help="Stop a managed server for a site directory")
+    p_stop.add_argument("site")
+
+    p_status = sub.add_parser("status", help="Show managed server status for a site directory")
+    p_status.add_argument("site")
+
+    p_cleanup = sub.add_parser("cleanup", help="List or stop managed servers under the artifact root")
+    p_cleanup.add_argument("--root", type=Path, default=DEFAULT_ROOT)
+    p_cleanup.add_argument("--stop-running", action="store_true")
+
+    p_run = sub.add_parser("run-server", help=argparse.SUPPRESS)
+    p_run.add_argument("site")
+    p_run.add_argument("--host", required=True)
+    p_run.add_argument("--port", type=int, required=True)
+    p_run.add_argument("--ttl", type=int, required=True)
+
+    args = parser.parse_args()
+    if args.command == "start":
+        return start(resolve_site(args.site), args.host, args.port, args.ttl, args.allow_lan, args.allow_symlinks)
+    if args.command == "stop":
+        return stop(resolve_site(args.site))
+    if args.command == "status":
+        return status(resolve_site(args.site))
+    if args.command == "cleanup":
+        return cleanup(args.root, stop_running=args.stop_running)
+    if args.command == "run-server":
+        return run_server(resolve_site(args.site), args.host, args.port, args.ttl)
+    raise SystemExit(f"unknown command: {args.command}")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
