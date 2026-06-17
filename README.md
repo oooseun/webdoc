@@ -1,18 +1,20 @@
 # webdoc
 
-**Turn any document into a local website that presents the key information to your team — and collects their feedback back to your machine.**
+**Turn the output of a Claude Code (or Codex) session into an interactive local website — easier to read, digest, and iterate on than scrolling Markdown in a terminal.**
 
-`webdoc` is a skill for [Claude Code](https://code.claude.com/docs/en/skills) and [OpenAI Codex](https://developers.openai.com/codex/skills). Point it at a report, dossier, research memo, comparison matrix, project status, or handoff, and it renders a polished, navigable, local‑first website — tables, charts, diagrams, a table of contents — with an optional feedback form that writes responses to durable local storage the author can read directly. No cloud, no copy‑paste, no public exposure by default.
+`webdoc` is a skill for [Claude Code](https://code.claude.com/docs/en/skills) and [OpenAI Codex](https://developers.openai.com/codex/skills). When an agent produces a long report, dossier, research memo, comparison matrix, project status, or handoff, webdoc renders that output into a polished, navigable, local‑first website — a table of contents, real tables, charts, diagrams — so you can actually take it in. Because the page is interactive, you can leave feedback right on it; the agent reads your notes back from durable local storage and revises. No cloud, no copy‑paste, no public exposure by default.
 
 ## Why
 
-A long Markdown report is hard to scan and harder to gather sign‑off on. `webdoc` gives the document a presentation layer your team can read in a browser, and turns "what did everyone think?" into a file you can read instead of a thread you have to chase. The source document stays canonical; the website is a view of it.
+A long agent answer is hard to read as raw Markdown in a terminal — you scroll, you lose the structure, dense tables wrap into noise. webdoc gives that output a real reading surface: a navigable page you can scan, search, and return to. And the interactivity closes the loop — instead of pasting "change this, fix that" back into chat, you annotate the page and the agent picks it up from a local file and iterates. The loop is for *you* first; sharing the result with a team is just one way to use it.
+
+The source document stays canonical — the website is a view of it, never a rewrite.
 
 ## What it does
 
-- **Renders** a Markdown/report source into a static site (`index.html`, `style.css`, `manifest.json`).
+- **Renders** a Markdown/report source into a static site (`index.html`, `style.css`, `manifest.json`) with a table of contents, responsive tables, and code‑generated visuals.
 - **Serves** it on `127.0.0.1` only, on an OS‑assigned port, with a finite TTL and clean shutdown.
-- **Captures feedback** — the browser UI is never the source of truth; submissions `POST` to a localhost API and the server appends them to `feedback.jsonl` in the site directory. The agent reads that file directly.
+- **Captures feedback for iteration** — leave notes on the page; submissions `POST` to a localhost API and append to `feedback.jsonl` in the site directory. The agent reads that file directly and revises — no copy‑paste back into chat. The browser UI is never the source of truth.
 - **Stays local** — loopback binding by default, no external assets, no symlink escape, no "kill whatever owns port 3000."
 
 ## Requirements
@@ -29,7 +31,7 @@ ln -s "$(pwd)/webdoc" ~/.claude/skills/webdoc     # Claude Code
 ln -s "$(pwd)/webdoc" ~/.codex/skills/webdoc      # Codex
 ```
 
-The agent will invoke the skill automatically when it's about to produce a report, dossier, research memo, or similar durable artifact. You can also drive the scripts by hand.
+The agent invokes the skill automatically when it's about to produce a report, dossier, research memo, or similar durable artifact. You can also drive the scripts by hand.
 
 ## Usage
 
@@ -48,7 +50,7 @@ python3 scripts/serve_site.py status ./report_site
 python3 scripts/serve_site.py stop ./report_site
 ```
 
-Read the team's feedback:
+Read your feedback (what the agent consumes to iterate):
 
 ```bash
 cat ./report_site/feedback.jsonl
