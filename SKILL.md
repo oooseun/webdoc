@@ -116,6 +116,22 @@ Embeds are injected verbatim (local-only; never host an embed that carries secre
 
 Never use looping CSS keyframes or GIFs for technical content — they are noisy and hard to read. A `stepper` is almost always the better tool.
 
+## Concept Variations
+
+For a substantial animation or rich interactive visual — or whenever the user asks — do not commit to the first idea. Generate at least five distinct concepts and let the user choose. Skip this for trivial bits (a single toggle, a fade); build those directly.
+
+1. Plan the UX: write the question the visual answers and five genuinely different ways to answer it (discrete stepper, annotated timeline, before/after toggle, layered build-up, interactive diagram). Different approaches, not restyles of one.
+2. Build each concept as its own webdoc site (a separate `create_site.py` run into its own dir). You can generate the concepts in parallel with subagents.
+3. Assemble a gallery the user flips through on one page:
+
+   ```bash
+   python3 scripts/gallery.py --out ~/agent-artifacts/sites/<id>-gallery --title "Clock cycle" \
+     --concept "Discrete steps=<site_a>" --concept "Annotated timeline=<site_b>" --concept "Before/after=<site_c>"
+   ```
+
+4. Serve the gallery dir (it auto-opens). The user clicks tabs to compare, pops any concept out full-screen, and presses "Choose this concept" — the pick lands in the gallery's `feedback.jsonl`.
+5. Read `feedback.jsonl` for the `CHOSEN:` line, then build the final artifact around that concept.
+
 ## Doc Export And Fidelity
 
 Every build also writes a single self-contained `doc.html` (all CSS inline, no scripts, images embedded as data URIs) for Google Docs.
@@ -133,6 +149,24 @@ Every build also writes a single self-contained `doc.html` (all CSS inline, no s
 ```
 
 Set `auto_open` to `false` to stop auto-opening. Per run, `--open` / `--no-open` override the config. Only loopback URLs are ever opened.
+
+## Templates
+
+A template is a complete stylesheet that swaps webdoc's look — color, type, spacing — without touching the content. Pick one with `--template`:
+
+```bash
+python3 scripts/create_site.py report.md --template standard
+python3 scripts/create_site.py report.md --template ./fashion-theme.css   # try a deviation
+```
+
+Only `standard` ships with the skill. To deviate for a kind of work (a fashion-trends look, a finance look), author a complete stylesheet and build with `--template ./that.css`. If it works for the user, offer to save it as a reusable category:
+
+```bash
+python3 scripts/templates.py save fashion-trends --from ./that.css
+python3 scripts/templates.py list
+```
+
+Saved categories live privately under `~/.config/webdoc/templates/<name>/` (never uploaded). Reuse one with `--template fashion-trends`; a team gets a cohesive look by copying that directory. Templates control theme only — structural/layout templates are out of scope for now.
 
 ## Persistent Website Feedback
 
@@ -167,8 +201,10 @@ Prompting rules: state the question each visual answers before choosing a form; 
 
 ## Scripts
 
-- `scripts/create_site.py`: Convert a Markdown/report source into a unified static website (`index.html`, `style.css`, `manifest.json`, feedback UI) plus the self-contained `doc.html` export. Supports `stepper`/`embed` blocks, `[+]/[-]/[~]` table cells, and `--css/--js/--asset` bundling.
+- `scripts/create_site.py`: Convert a Markdown/report source into a unified static website (`index.html`, `style.css`, `manifest.json`, feedback UI) plus the self-contained `doc.html` export. Supports `stepper`/`embed` blocks, `[+]/[-]/[~]` table cells, `--template`, and `--css/--js/--asset` bundling.
 - `scripts/serve_site.py`: Start, stop, inspect, or clean up a localhost-only preview server with `server.json`, durable `feedback.jsonl`, and config-driven auto-open.
+- `scripts/templates.py`: List built-in templates and save a stylesheet as a private reusable category.
+- `scripts/gallery.py`: Assemble a concepts gallery — one switcher page over several built concept sites — for the Concept Variations workflow.
 - `scripts/settings.py`: Read user config from `~/.config/webdoc/settings.json`.
 
 Useful commands:

@@ -18,10 +18,18 @@ DEFAULTS: dict[str, object] = {
 }
 
 
-def config_path() -> Path:
+def config_dir() -> Path:
     base = os.environ.get("XDG_CONFIG_HOME")
     root = Path(base).expanduser() if base else Path("~/.config").expanduser()
-    return root / "webdoc" / "settings.json"
+    return root / "webdoc"
+
+
+def templates_dir() -> Path:
+    return config_dir() / "templates"
+
+
+def config_path() -> Path:
+    return config_dir() / "settings.json"
 
 
 def read_settings() -> dict[str, object]:

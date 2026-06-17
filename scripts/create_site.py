@@ -28,6 +28,35 @@ from pathlib import Path
 SKILL_DIR = Path(__file__).resolve().parents[1]
 DEFAULT_ROOT = Path(os.environ.get("AGENT_ARTIFACT_SITES", "~/agent-artifacts/sites")).expanduser()
 
+try:
+    from settings import templates_dir
+except Exception:  # pragma: no cover - settings module should sit beside this file
+    def templates_dir() -> Path:
+        base = os.environ.get("XDG_CONFIG_HOME")
+        root = Path(base).expanduser() if base else Path("~/.config").expanduser()
+        return root / "webdoc" / "templates"
+
+
+def resolve_template(value: str) -> Path:
+    """Resolve a theme template to a complete stylesheet.
+
+    Accepts a path to a .css file, a directory containing style.css, a saved user
+    category under ~/.config/webdoc/templates/<name>/, or a built-in template name.
+    """
+    candidate = Path(value).expanduser()
+    if candidate.suffix == ".css" and candidate.is_file():
+        return candidate
+    if candidate.is_dir() and (candidate / "style.css").is_file():
+        return candidate / "style.css"
+    user = templates_dir() / value / "style.css"
+    if user.is_file():
+        return user
+    builtin = SKILL_DIR / "templates" / value / "style.css"
+    if builtin.is_file():
+        return builtin
+    raise SystemExit(f"template not found: {value!r} (looked for a .css file, {user}, and {builtin})")
+
+
 # Conditional-format markers usable as the first token of a table cell.
 CELL_CLASS = {"[+]": "cell-good", "[-]": "cell-bad", "[~]": "cell-warn"}
 CELL_DOC_STYLE = {
@@ -600,6 +629,7 @@ def main() -> int:
     parser.add_argument("--title", help="Override page title")
     parser.add_argument("--artifact-id", help="Override artifact id")
     parser.add_argument("--snapshot", action="store_true", help="Append a timestamp to the artifact id")
+    parser.add_argument("--template", default="standard", help="Theme template: a name (standard or a saved category) or a path to a style.css")
     parser.add_argument("--css", action="append", default=[], metavar="PATH", help="Extra stylesheet to bundle and link (repeatable)")
     parser.add_argument("--js", action="append", default=[], metavar="PATH", help="Extra script to bundle and load deferred (repeatable)")
     parser.add_argument("--asset", action="append", default=[], metavar="PATH", help="Media file to copy into the site's assets/ (repeatable)")
@@ -625,8 +655,7 @@ def main() -> int:
     doc_body, _, doc_state = parse_markdown(markdown, mode="doc")
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    css_src = SKILL_DIR / "assets" / "report.css"
-    shutil.copyfile(css_src, out_dir / "style.css")
+    shutil.copyfile(resolve_template(args.template), out_dir / "style.css")
     if state.get("stepper"):
         shutil.copyfile(SKILL_DIR / "assets" / "stepper.js", out_dir / "stepper.js")
 
@@ -663,6 +692,7 @@ def main() -> int:
         "feedback_path": str(out_dir / "feedback.jsonl"),
         "generated_at": generated_at,
         "generator": "webdoc/create_site.py",
+        "template": args.template,
         "doc_export": doc_export,
     }
 
