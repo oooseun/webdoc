@@ -13,9 +13,13 @@ The source document stays canonical — the website is a view of it, never a rew
 ## What it does
 
 - **Renders** a Markdown/report source into a static site (`index.html`, `style.css`, `manifest.json`) with a table of contents, responsive tables, and code‑generated visuals.
-- **Serves** it on `127.0.0.1` only, on an OS‑assigned port, with a finite TTL and clean shutdown.
-- **Captures feedback for iteration** — leave notes on the page; submissions `POST` to a localhost API and append to `feedback.jsonl` in the site directory. The agent reads that file directly and revises — no copy‑paste back into chat. The browser UI is never the source of truth.
-- **Stays local** — loopback binding by default, no external assets, no symlink escape, no "kill whatever owns port 3000."
+- **Interactive components in one source.** Author click‑to‑step state machines (` ```stepper `) and arbitrary HTML/JS/media (` ```embed ` — audio, photo galleries, toggles) right in the Markdown. No looping animations; the reader controls the pace.
+- **Dense tables.** Bold the advantageous value with `**…**`; lead a cell with `[+]` / `[-]` / `[~]` for green / red / amber conditional formatting.
+- **Google Docs export.** Every build also writes a single self‑contained `doc.html` — upload it to Google Drive and Open with Google Docs. A fidelity ledger reports exactly which interactive/audio bits won't survive the conversion.
+- **Anti‑AI prose.** Applies an embedded copy of the [avoid‑ai‑writing](https://github.com/conorbronsdon/avoid-ai-writing) ruleset to everything it writes.
+- **Captures feedback for iteration** — leave notes on the page; submissions `POST` to a localhost API and append to `feedback.jsonl`. The agent reads that file directly and revises — no copy‑paste back into chat.
+- **Auto‑opens** the finished site in your browser (toggle in `~/.config/webdoc/settings.json`).
+- **Stays local** — loopback binding, OS‑assigned port, finite TTL, clean shutdown; no symlink escape.
 
 ## Requirements
 
@@ -40,9 +44,12 @@ Create a site from a Markdown file:
 ```bash
 python3 scripts/create_site.py report.md
 python3 scripts/create_site.py report.md --out ./report_site --title "Research Report"
+python3 scripts/create_site.py report.md --css custom.css --js widget.js --asset clip.mp3
 ```
 
-Serve it locally (loopback only, auto‑assigned port, 2‑hour TTL):
+Each build also writes `doc.html` next to `index.html`. To get it into Google Docs, upload that file to Google Drive, then right‑click → Open with → Google Docs.
+
+Serve it locally (loopback only, auto‑assigned port, 2‑hour TTL; opens the browser unless `--no-open`):
 
 ```bash
 python3 scripts/serve_site.py start ./report_site --ttl 7200
@@ -59,12 +66,14 @@ cat ./report_site/feedback.jsonl
 ## How it fits together
 
 - `SKILL.md` — the full instruction set the agent follows: when to create vs. offer vs. skip, the decision matrix, the feedback rule, visual‑explanation guidance, and the quality bar.
-- `scripts/create_site.py` — Markdown/report → static website with feedback UI.
-- `scripts/serve_site.py` — start/stop/inspect a localhost‑only preview server with durable `feedback.jsonl`.
+- `scripts/create_site.py` — Markdown/report → unified site (`index.html`) plus the self‑contained `doc.html` export; handles `stepper`/`embed` blocks, conditional‑format cells, and `--css/--js/--asset` bundling.
+- `scripts/serve_site.py` — start/stop/inspect a localhost‑only preview server with durable `feedback.jsonl` and config‑driven auto‑open.
+- `scripts/settings.py` — reads user config from `~/.config/webdoc/settings.json`.
+- `assets/report.css` — base stylesheet; `assets/stepper.js` — the click‑to‑step interaction primitive.
+- `references/avoid-ai-writing.md` — the full anti‑AI‑writing ruleset, applied to all generated prose.
 - `references/presenter-role.md` — role prompt for a narrow "presenter" subagent that lays out and verifies the site without touching the analysis.
 - `references/research-basis.md` — the research and source map the design is built on.
 - `agents/openai.yaml` — Codex skill interface metadata.
-- `assets/report.css` — base stylesheet.
 
 ## Design principles
 
@@ -73,6 +82,10 @@ cat ./report_site/feedback.jsonl
 - Static output over dev servers; build tools only when real interactivity is needed.
 - Local‑only by default. A local site may carry secrets, so never host or share one off the machine without explicit intent.
 
+## Attribution
+
+webdoc embeds the anti‑AI‑writing ruleset from [conorbronsdon/avoid-ai-writing](https://github.com/conorbronsdon/avoid-ai-writing) (MIT) — its operational core is inlined in `SKILL.md` and the full text is bundled verbatim as `references/avoid-ai-writing.md`. See [`NOTICE`](NOTICE).
+
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE). Bundled third‑party material retains its own license; see [`NOTICE`](NOTICE).

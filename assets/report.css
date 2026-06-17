@@ -306,4 +306,104 @@ tr:last-child td {
     box-shadow: none;
     padding: 0;
   }
+
+  .stepper-controls {
+    display: none;
+  }
+
+  .stepper .step[hidden] {
+    display: block;
+  }
+}
+
+/* Conditional-format table cells: bold the winner with **, color with [+]/[-]/[~]. */
+.cell-good {
+  background: #e6f4ea;
+  color: #14532d;
+}
+
+.cell-bad {
+  background: #fde8e8;
+  color: #7f1d1d;
+}
+
+.cell-warn {
+  background: #fef3e2;
+  color: #7c4a03;
+}
+
+/* Stepper: click-to-advance state machine. No autoplay, no looping animation. */
+.stepper {
+  margin: 0 0 1.1rem;
+  padding: 16px 18px;
+  border: 1px solid var(--line);
+  background: #fbfdfb;
+}
+
+.stepper figcaption {
+  margin: 0 0 10px;
+  font-weight: 700;
+}
+
+.stepper-steps {
+  min-height: 3em;
+}
+
+.stepper .step > :first-child {
+  margin-top: 0;
+}
+
+.stepper .step > :last-child {
+  margin-bottom: 0;
+}
+
+.stepper-controls {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.stepper-controls button {
+  appearance: none;
+  border: 1px solid var(--line);
+  background: white;
+  color: var(--ink);
+  padding: 6px 12px;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.stepper-controls button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+[data-stepper-status] {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Media embeds: audio players, figures, photo galleries. */
+figure {
+  margin: 0 0 1.1rem;
+}
+
+figure img,
+.gallery img {
+  display: block;
+  max-width: 100%;
+  height: auto;
+}
+
+audio {
+  width: 100%;
+  margin: 8px 0;
+}
+
+.gallery {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+  gap: 10px;
 }

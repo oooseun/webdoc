@@ -18,8 +18,15 @@ from pathlib import Path
 from socketserver import ThreadingMixIn
 from urllib.parse import urlparse
 
+try:
+    from settings import read_settings
+except Exception:  # pragma: no cover - settings module should sit beside this file
+    def read_settings() -> dict:
+        return {"auto_open": True}
+
 
 DEFAULT_ROOT = Path(os.environ.get("AGENT_ARTIFACT_SITES", "~/agent-artifacts/sites")).expanduser()
+LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 DEFAULT_TTL_SECONDS = 4 * 60 * 60
 MAX_FEEDBACK_BYTES = 64 * 1024
 FEEDBACK_LOCK = threading.Lock()
@@ -213,12 +220,30 @@ def run_server(site_dir: Path, host: str, port: int, ttl: int) -> int:
     return 0
 
 
-def start(site_dir: Path, host: str, port: int, ttl: int, allow_lan: bool, allow_symlinks: bool) -> int:
-    if host not in {"127.0.0.1", "localhost", "::1"} and not allow_lan:
+def open_url(url: str) -> bool:
+    """Open a URL in the default browser; best-effort, never raises."""
+    for cmd in (["open", url], ["xdg-open", url]):
+        try:
+            subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return True
+        except (FileNotFoundError, OSError):
+            continue
+    try:
+        import webbrowser
+
+        return webbrowser.open(url)
+    except Exception:
+        return False
+
+
+def start(site_dir: Path, host: str, port: int, ttl: int, allow_lan: bool, allow_symlinks: bool, want_open: bool = False) -> int:
+    if host not in LOOPBACK_HOSTS and not allow_lan:
         raise SystemExit("refusing non-loopback host without --allow-lan")
     validate_site(site_dir, allow_symlinks=allow_symlinks)
     info = load_server_info(site_dir)
     if info and pid_alive(int(info.get("pid", -1))) and str(info.get("site_dir")) == str(site_dir):
+        if want_open and host in LOOPBACK_HOSTS and info.get("url"):
+            open_url(str(info["url"]))
         print(json.dumps(info, indent=2, sort_keys=True))
         return 0
 
@@ -253,6 +278,8 @@ def start(site_dir: Path, host: str, port: int, ttl: int, allow_lan: bool, allow
     while time.time() < deadline:
         info = load_server_info(site_dir)
         if info and int(info.get("pid", -1)) == child.pid:
+            if want_open and host in LOOPBACK_HOSTS and info.get("url"):
+                open_url(str(info["url"]))
             print(json.dumps(info, indent=2, sort_keys=True))
             return 0
         if child.poll() is not None:
@@ -334,6 +361,8 @@ def main() -> int:
     p_start.add_argument("--ttl", type=int, default=DEFAULT_TTL_SECONDS, help="Seconds before auto-shutdown; 0 disables TTL")
     p_start.add_argument("--allow-lan", action="store_true")
     p_start.add_argument("--allow-symlinks", action="store_true")
+    p_start.add_argument("--open", dest="open", action="store_true", help="Open the site in the browser after start (overrides config)")
+    p_start.add_argument("--no-open", dest="no_open", action="store_true", help="Do not open the browser after start (overrides config)")
 
     p_stop = sub.add_parser("stop", help="Stop a managed server for a site directory")
     p_stop.add_argument("site")
@@ -353,7 +382,12 @@ def main() -> int:
 
     args = parser.parse_args()
     if args.command == "start":
-        return start(resolve_site(args.site), args.host, args.port, args.ttl, args.allow_lan, args.allow_symlinks)
+        want_open = bool(read_settings().get("auto_open", True))
+        if args.no_open:
+            want_open = False
+        elif args.open:
+            want_open = True
+        return start(resolve_site(args.site), args.host, args.port, args.ttl, args.allow_lan, args.allow_symlinks, want_open=want_open)
     if args.command == "stop":
         return stop(resolve_site(args.site))
     if args.command == "status":
