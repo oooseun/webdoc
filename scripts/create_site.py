@@ -20,6 +20,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -89,6 +90,17 @@ def source_hash(path: Path) -> str:
     return h.hexdigest()
 
 
+def block_hash(text: str) -> str:
+    """Short stable hash of an editable block's exact source text.
+
+    Emitted into the page as data-md-hash and re-checked server-side on save so
+    a block edited under the open tab is caught (409) instead of clobbered. The
+    client and server must compute it over the same string: for a line-range
+    block that is "\\n".join(lines[start-1:end]); for a table cell it is the raw
+    (split_table_row-stripped) cell field."""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
+
+
 def stable_artifact_id(path: Path, snapshot: bool = False) -> str:
     resolved = path.resolve()
     digest = hashlib.sha1(str(resolved).encode("utf-8")).hexdigest()[:8]
@@ -99,10 +111,16 @@ def stable_artifact_id(path: Path, snapshot: bool = False) -> str:
     return base
 
 
+_CTRL_RUN = re.compile(r"[\x00-\x20]+")
+
+
 def safe_href(href: str) -> str:
     href = href.strip()
-    lowered = href.lower()
-    if lowered.startswith(("javascript:", "data:", "vbscript:")):
+    # Browsers ignore interior/leading control + whitespace chars in a scheme,
+    # so "java\tscript:" or "\x01javascript:" would execute despite a naive
+    # prefix check. Strip all of [\x00-\x20] before testing the scheme.
+    probe = _CTRL_RUN.sub("", href).lower()
+    if probe.startswith(("javascript:", "data:", "vbscript:")):
         return "#"
     return href
 
@@ -121,7 +139,34 @@ def _image(src: str, alt: str) -> str:
     return f'<img src="{href_attr}" alt="{alt}" loading="lazy">'
 
 
+def _code_span(stash, match: "re.Match") -> str:
+    fence, content = match.group(1), match.group(2)
+    # CommonMark strips one leading + trailing space when a multi-backtick fence
+    # was padded to hold backtick-bearing content; single-backtick spans keep
+    # their content verbatim (webdoc's long-standing behaviour).
+    if len(fence) > 1 and len(content) >= 2 and content[0] == " " and content[-1] == " " and content.strip(" "):
+        content = content[1:-1]
+    return stash(f"<code>{content}</code>")
+
+
+# A leading block marker (-, *, +, #, >, or "1." / "1)") that the edit
+# round-trip backslash-escaped on write, so an edited paragraph that now begins
+# with one stays a paragraph. We strip the backslash and render the bare marker;
+# '>' needs no following space (parse_markdown treats ">x" as a quote too).
+_LEADING_MARKER_ESCAPE = re.compile(r"^\\(>|#{1,6}(?=\s)|[-*+](?=\s)|\d+[.)](?=\s))")
+
+
 def inline_md(text: str) -> str:
+    # Pull off a leading escaped block marker before anything else, and render
+    # it literally at the very end (only at the leading position - a mid-text
+    # "\-" is left to the general backslash rule). This keeps a paragraph that
+    # starts with "- ", "# ", "> ", or "1. " a paragraph, with no backslash shown.
+    leading_literal = ""
+    lead = _LEADING_MARKER_ESCAPE.match(text)
+    if lead:
+        leading_literal = html.escape(lead.group(1))
+        text = text[lead.end():]
+
     escaped = html.escape(text)
 
     # Protect generated tags via placeholders so later passes (e.g. bare-URL
@@ -132,7 +177,21 @@ def inline_md(text: str) -> str:
         placeholders.append(htmlfrag)
         return f"\x00{len(placeholders) - 1}\x00"
 
-    escaped = re.sub(r"`([^`]+)`", lambda m: stash(f"<code>{m.group(1)}</code>"), escaped)
+    # Code spans: an opening backtick run not escaped by a preceding backslash,
+    # closed by a run of the same length. Widening the fence lets backtick-
+    # bearing content round-trip; the (?<!\\) guard means a typed-then-escaped
+    # backtick (\`) is left for the backslash rule below, not eaten as a span.
+    escaped = re.sub(
+        r"(?<!\\)(`+)(.+?)\1(?!`)",
+        lambda m: _code_span(stash, m),
+        escaped,
+        flags=re.DOTALL,
+    )
+    # Backslash escapes for the characters this renderer treats as syntax. Run
+    # AFTER code spans are stashed (so a backslash inside `code` stays literal)
+    # and BEFORE the link/image/emphasis rules, so the edit round-trip can write
+    # a literal `*`/`` ` ``/`[`/`]`/`\` as \X and have it render as the bare char.
+    escaped = re.sub(r"\\([\\`*\[\]])", lambda m: stash(m.group(1)), escaped)
     # ![alt](src) images — must run before the link rule (it contains [alt](src))
     escaped = re.sub(
         r"!\[([^\]]*)\]\(([^)]+)\)",
@@ -162,16 +221,21 @@ def inline_md(text: str) -> str:
 
     # Restore placeholders
     escaped = re.sub(r"\x00(\d+)\x00", lambda m: placeholders[int(m.group(1))], escaped)
-    return escaped
+    return leading_literal + escaped
 
 
 def split_table_row(line: str) -> list[str]:
     line = line.strip()
     if line.startswith("|"):
         line = line[1:]
-    if line.endswith("|"):
+    # A trailing pipe is the row's closing delimiter only when it is not an
+    # escaped pipe (\|) belonging to the last cell's text.
+    if line.endswith("|") and not line.endswith("\\|"):
         line = line[:-1]
-    return [cell.strip() for cell in line.split("|")]
+    # Split on UNescaped pipes only, then unescape \| -> | per cell (standard
+    # Markdown). A row with no backslash splits exactly as before, so existing
+    # tables render unchanged.
+    return [cell.strip().replace("\\|", "|") for cell in re.split(r"(?<!\\)\|", line)]
 
 
 def is_table_separator(line: str) -> bool:
@@ -233,7 +297,7 @@ def render_stepper(block: str, meta: str, mode: str, state: dict) -> str:
         steps.append(f'<div class="step" data-step="{idx + 1}"{hidden}>{render_step_body(chunk)}</div>')
     total = len(chunks)
     return (
-        '<figure class="stepper" data-stepper aria-roledescription="step-through visualization">'
+        '<figure class="stepper" data-stepper data-noedit aria-roledescription="step-through visualization">'
         f"{caption}"
         f'<div class="stepper-steps">{"".join(steps)}</div>'
         '<div class="stepper-controls">'
@@ -260,7 +324,34 @@ def render_embed(block: str, mode: str, state: dict) -> str:
     state["dropped"].add("interactive HTML embeds")
     if mode == "doc":
         return "<p><em>[Interactive element omitted in the document export — view the website version.]</em></p>"
-    return block
+    # Wrap with data-noedit so edit mode gives embeds the same view-only
+    # affordance as the stepper/code/blockquote (and never makes them editable).
+    return f'<div class="webdoc-embed" data-noedit>{block}</div>'
+
+
+def _md_attrs(lines: list[str], start0: int, end0_excl: int, btype: str) -> str:
+    """Edit-mode identity for a line-range block (paragraph/heading/listitem).
+
+    start0/end0_excl are 0-based [start, end) into `lines`. Emits 1-based
+    inclusive data-md-start/end, a hash of the exact source slice, and the type
+    so the in-page editor can locate and round-trip the block."""
+    digest = block_hash("\n".join(lines[start0:end0_excl]))
+    return (
+        f' data-md-start="{start0 + 1}" data-md-end="{end0_excl}"'
+        f' data-md-hash="{digest}" data-md-type="{btype}"'
+    )
+
+
+def _cell_attrs(line0: int, col: int, field: str) -> str:
+    """Edit-mode identity for a table cell (sub-line unit).
+
+    line0 is the row's 0-based source line; col is the 0-based column. `field`
+    is the raw (split_table_row-stripped) cell source, hashed for drift checks."""
+    digest = block_hash(field)
+    return (
+        f' data-md-line="{line0 + 1}" data-md-cell="{col}"'
+        f' data-md-hash="{digest}" data-md-type="tablecell"'
+    )
 
 
 def parse_markdown(markdown: str, mode: str = "site") -> tuple[str, list[dict[str, str]], dict]:
@@ -269,6 +360,10 @@ def parse_markdown(markdown: str, mode: str = "site") -> tuple[str, list[dict[st
     toc: list[dict[str, str]] = []
     used_ids: set[str] = set()
     state: dict = {"dropped": set(), "stepper": False, "embed": False}
+    # Edit-mode block identity is emitted only for the interactive site, never
+    # the doc.html export (which must stay clean for the Google Docs path).
+    editable = mode == "site"
+    noedit = " data-noedit" if editable else ""
     i = 0
 
     while i < len(lines):
@@ -278,6 +373,8 @@ def parse_markdown(markdown: str, mode: str = "site") -> tuple[str, list[dict[st
         if not stripped:
             i += 1
             continue
+
+        block_start = i  # 0-based source line where this block begins
 
         fence = re.match(r"^```\s*([A-Za-z][\w.+-]*)?\s*(.*?)\s*$", stripped)
         if fence:
@@ -298,7 +395,7 @@ def parse_markdown(markdown: str, mode: str = "site") -> tuple[str, list[dict[st
                 out.append(render_embed(block, mode, state))
                 continue
             class_attr = f' class="language-{html.escape(language, quote=True)}"' if language else ""
-            out.append(f"<pre><code{class_attr}>{html.escape(block)}</code></pre>")
+            out.append(f"<pre{noedit}><code{class_attr}>{html.escape(block)}</code></pre>")
             continue
 
         heading = re.match(r"^(#{1,4})\s+(.+?)\s*$", line)
@@ -308,7 +405,8 @@ def parse_markdown(markdown: str, mode: str = "site") -> tuple[str, list[dict[st
             section_id = unique_id(text, used_ids)
             if level <= 3:
                 toc.append({"level": str(level), "id": section_id, "text": text})
-            out.append(f'<h{level} id="{section_id}">{inline_md(text)}</h{level}>')
+            attrs = _md_attrs(lines, block_start, block_start + 1, "heading") if editable else ""
+            out.append(f'<h{level} id="{section_id}"{attrs}>{inline_md(text)}</h{level}>')
             i += 1
             continue
 
@@ -318,18 +416,22 @@ def parse_markdown(markdown: str, mode: str = "site") -> tuple[str, list[dict[st
             and "|" in lines[i + 1]
             and is_table_separator(lines[i + 1])
         ):
+            header_idx = block_start  # 0-based source line of the header row
             headers = split_table_row(line)
             i += 2
             rows: list[list[str]] = []
+            row_idxs: list[int] = []
             while i < len(lines) and lines[i].strip() and "|" in lines[i]:
                 rows.append(split_table_row(lines[i]))
+                row_idxs.append(i)
                 i += 1
             table = ['<div class="table-wrap"><table><thead><tr>']
-            for cell in headers:
+            for col, cell in enumerate(headers):
                 _, text = cell_marker(cell)
-                table.append(f"<th>{inline_md(text)}</th>")
+                cattrs = _cell_attrs(header_idx, col, cell) if editable else ""
+                table.append(f"<th{cattrs}>{inline_md(text)}</th>")
             table.append("</tr></thead><tbody>")
-            for row in rows:
+            for r, row in enumerate(rows):
                 table.append("<tr>")
                 for idx in range(len(headers)):
                     cell = row[idx] if idx < len(row) else ""
@@ -340,26 +442,35 @@ def parse_markdown(markdown: str, mode: str = "site") -> tuple[str, list[dict[st
                         attr = f' class="{CELL_CLASS[token]}"'
                     else:
                         attr = ""
-                    table.append(f"<td{attr}>{inline_md(text)}</td>")
+                    cattrs = _cell_attrs(row_idxs[r], idx, cell) if editable else ""
+                    table.append(f"<td{attr}{cattrs}>{inline_md(text)}</td>")
                 table.append("</tr>")
             table.append("</tbody></table></div>")
             out.append("".join(table))
             continue
 
         if re.match(r"^\s*[-*]\s+", line):
-            items: list[str] = []
+            items: list[tuple[str, int]] = []
             while i < len(lines) and re.match(r"^\s*[-*]\s+", lines[i]):
-                items.append(re.sub(r"^\s*[-*]\s+", "", lines[i]).strip())
+                items.append((re.sub(r"^\s*[-*]\s+", "", lines[i]).strip(), i))
                 i += 1
-            out.append("<ul>" + "".join(f"<li>{inline_md(item)}</li>" for item in items) + "</ul>")
+            lis = []
+            for item, idx0 in items:
+                attrs = _md_attrs(lines, idx0, idx0 + 1, "listitem") if editable else ""
+                lis.append(f"<li{attrs}>{inline_md(item)}</li>")
+            out.append("<ul>" + "".join(lis) + "</ul>")
             continue
 
         if re.match(r"^\s*\d+[.)]\s+", line):
             items = []
             while i < len(lines) and re.match(r"^\s*\d+[.)]\s+", lines[i]):
-                items.append(re.sub(r"^\s*\d+[.)]\s+", "", lines[i]).strip())
+                items.append((re.sub(r"^\s*\d+[.)]\s+", "", lines[i]).strip(), i))
                 i += 1
-            out.append("<ol>" + "".join(f"<li>{inline_md(item)}</li>" for item in items) + "</ol>")
+            lis = []
+            for item, idx0 in items:
+                attrs = _md_attrs(lines, idx0, idx0 + 1, "listitem") if editable else ""
+                lis.append(f"<li{attrs}>{inline_md(item)}</li>")
+            out.append("<ol>" + "".join(lis) + "</ol>")
             continue
 
         if stripped.startswith(">"):
@@ -367,7 +478,7 @@ def parse_markdown(markdown: str, mode: str = "site") -> tuple[str, list[dict[st
             while i < len(lines) and lines[i].strip().startswith(">"):
                 quote_lines.append(lines[i].strip().lstrip(">").strip())
                 i += 1
-            out.append(f"<blockquote><p>{inline_md(' '.join(quote_lines))}</p></blockquote>")
+            out.append(f"<blockquote{noedit}><p>{inline_md(' '.join(quote_lines))}</p></blockquote>")
             continue
 
         para: list[str] = [stripped]
@@ -393,7 +504,8 @@ def parse_markdown(markdown: str, mode: str = "site") -> tuple[str, list[dict[st
                 break
             para.append(look_stripped)
             i += 1
-        out.append(f"<p>{inline_md(' '.join(para))}</p>")
+        attrs = _md_attrs(lines, block_start, i, "paragraph") if editable else ""
+        out.append(f"<p{attrs}>{inline_md(' '.join(para))}</p>")
 
     return "\n".join(out), toc, state
 
@@ -440,6 +552,7 @@ def render_html(
 ) -> str:
     generated = html.escape(str(manifest["generated_at"]))
     source_display = html.escape(str(source))
+    source_name = html.escape(Path(source).name, quote=True)
     title_html = html.escape(title)
     artifact_json = json.dumps(str(manifest["artifact_id"]))
 
@@ -463,6 +576,9 @@ def render_html(
         scripts += '\n    <script src="./stepper.js" defer></script>'
     for name in (custom_js or []):
         scripts += f'\n    <script src="./{html.escape(name, quote=True)}" defer></script>'
+    # Editing mode: bundled into the interactive site only. Inert until the
+    # reader clicks Edit; the doc.html export never loads this.
+    scripts += '\n    <script src="./edit.js" defer></script>'
 
     return f"""<!doctype html>
 <html lang="en">
@@ -471,8 +587,9 @@ def render_html(
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{title_html}</title>
   <link rel="stylesheet" href="./style.css">{css_links}
+  <link rel="stylesheet" href="./edit.css">
 </head>
-<body>
+<body data-webdoc-source="{source_name}">
   <div class="shell">
     <header class="masthead">
       <p class="eyebrow">Local document site</p>
@@ -633,6 +750,7 @@ def main() -> int:
     parser.add_argument("--css", action="append", default=[], metavar="PATH", help="Extra stylesheet to bundle and link (repeatable)")
     parser.add_argument("--js", action="append", default=[], metavar="PATH", help="Extra script to bundle and load deferred (repeatable)")
     parser.add_argument("--asset", action="append", default=[], metavar="PATH", help="Media file to copy into the site's assets/ (repeatable)")
+    parser.add_argument("--no-lint", action="store_true", help="skip the AI-writing prose gate (escape hatch; not recommended)")
     args = parser.parse_args()
 
     source = args.source.expanduser()
@@ -647,6 +765,21 @@ def main() -> int:
         return 2
 
     markdown = source.read_text(encoding="utf-8", errors="replace")
+
+    # Prose gate: block on structural AI-writing tells before building. Native
+    # (scripts/lint_prose.py), no external dependency. See references/structural-tells.md.
+    if not args.no_lint:
+        linter = Path(__file__).resolve().parent / "lint_prose.py"
+        if linter.exists():
+            gate = subprocess.run([sys.executable, str(linter), str(source)])
+            if gate.returncode == 1:
+                print(
+                    "build blocked: structural AI-writing tells found above. "
+                    "Fix them, or rebuild with --no-lint to bypass.",
+                    file=sys.stderr,
+                )
+                return 1
+
     title = args.title or read_title(markdown, source.stem.replace("_", " ").replace("-", " ").title())
     digest = source_hash(source)
     generated_at = now_iso()
@@ -658,6 +791,10 @@ def main() -> int:
     shutil.copyfile(resolve_template(args.template), out_dir / "style.css")
     if state.get("stepper"):
         shutil.copyfile(SKILL_DIR / "assets" / "stepper.js", out_dir / "stepper.js")
+    # Editing-mode assets, bundled into every site (index.html links them; the
+    # doc.html export does not). Inert until the reader clicks Edit.
+    shutil.copyfile(SKILL_DIR / "assets" / "edit.js", out_dir / "edit.js")
+    shutil.copyfile(SKILL_DIR / "assets" / "edit.css", out_dir / "edit.css")
 
     for asset in args.asset:
         copy_into(Path(asset), out_dir, subdir="assets")

@@ -26,3 +26,19 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+------------------------------------------------------------------------
+anti-ai-rhetoric — the counted "second-pass audit" approach in
+references/structural-tells.md (and the SKILL.md structural-tells section)
+is adapted from its verification passes. No text copied verbatim; the
+patterns and the enforce-by-counting idea are reused.
+Source: https://github.com/matteoroversi/anti-ai-rhetoric
+License: MIT (Copyright (c) Matteo Roversi). Same MIT terms as above apply.
+
+------------------------------------------------------------------------
+Wikipedia, "Signs of AI writing" (WikiProject AI Cleanup) — informs the
+structural-tell catalogue in references/structural-tells.md. Patterns are
+referenced and re-expressed in our own words and examples; no passage is
+reproduced verbatim.
+Source: https://en.wikipedia.org/wiki/Wikipedia:Signs_of_AI_writing
+License: CC BY-SA 4.0.

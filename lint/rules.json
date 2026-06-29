@@ -1,0 +1,101 @@
+{
+  "_comment": "Structural AI-writing rules for webdoc's native prose linter (scripts/lint_prose.py). No external dependency (reimplements the slice of Vale we need). 'kind': existence = regex search per prose line; occurrence = count regex matches per paragraph (lines joined with spaces), flag when >= min; staccato = run of short sentences in a paragraph. 'severity': error blocks the build (create_site.py), warning/suggestion only report. %s in a message is filled with the matched text (existence) or the count (occurrence/staccato). Regex is Python re syntax (JSON-escaped: \\b, \\s), applied to prose only (fenced code and inline code are stripped first).",
+  "rules": [
+    {
+      "name": "negative-parallelism",
+      "kind": "existence",
+      "severity": "warning",
+      "ignorecase": true,
+      "message": "Negative parallelism near '%s' - a single contrast is fine; if they cluster, state it directly instead of leaning on the contrast.",
+      "patterns": [
+        "\\b(?!(?:However|Also|Therefore|Yes|No|Finally|Indeed|Otherwise|Again|First|Sometimes),)[A-Za-z]{2,},\\s+not\\b",
+        "\\bnot only\\b[^.]{0,80}\\bbut\\b",
+        "\\bit'?s not\\b[^.]{0,80}\\bit'?s\\b",
+        "\\bisn'?t\\b[^.]{0,80}\\bit'?s\\b",
+        "\\bnot\\b[^,.;]{1,40}\\bbut rather\\b",
+        "\\brather than\\b",
+        "\\binstead of\\b"
+      ]
+    },
+    {
+      "name": "stacked-negation",
+      "kind": "occurrence",
+      "severity": "error",
+      "ignorecase": true,
+      "min": 2,
+      "message": "Stacked negation: %s sentence-initial negations in one paragraph - collapse to a positive statement.",
+      "pattern": "(?:^|[.!?]\\s+)(?:not|no)\\b"
+    },
+    {
+      "name": "signpost-opener",
+      "kind": "existence",
+      "severity": "error",
+      "ignorecase": true,
+      "message": "Signpost opener '%s' - delete the announcement and state the thing.",
+      "patterns": [
+        "(?:^|[.!?]\\s+|[\"'(]\\s*)(?:below is|below are|here is how|here'?s how|here is what|here'?s the thing|here'?s the deal|here'?s why|what follows is|in this section|in this (?:guide|article|post)|let'?s dive|let'?s explore|let'?s unpack|let'?s break|let'?s start by|let'?s (?:look|talk|walk) through|without further ado|we'?ll explore)\\b"
+      ]
+    },
+    {
+      "name": "em-dash",
+      "kind": "existence",
+      "severity": "error",
+      "ignorecase": false,
+      "message": "Em/en dash or double-hyphen ('%s') - target zero; use a period, comma, or parentheses.",
+      "patterns": ["—", "\\s--\\s", "[A-Za-z ][\\u2013\\u2015][A-Za-z ]", "\\w--\\w"]
+    },
+    {
+      "name": "tricolon",
+      "kind": "existence",
+      "severity": "suggestion",
+      "ignorecase": true,
+      "message": "Possible rule-of-three near '%s' - three parallel items joined by 'and'/'or'; vary the rhythm or cut one.",
+      "patterns": ["[^,;.\\n]{2,40},\\s+[^,;.\\n]{2,40},\\s+(?:and|or)\\b"]
+    },
+    {
+      "name": "aphorism",
+      "kind": "existence",
+      "severity": "warning",
+      "ignorecase": true,
+      "message": "Aphorism formula '%s' - replace with the concrete claim it gestures at.",
+      "patterns": ["\\bthe (?:power|art|rise|future|essence|language|currency|architecture|beauty|dance) of\\b"]
+    },
+    {
+      "name": "ai-vocab",
+      "kind": "existence",
+      "severity": "warning",
+      "ignorecase": true,
+      "message": "AI-vocabulary '%s' - prefer a plainer word.",
+      "patterns": ["\\b(?:leverag(?:e|es|ed|ing)|utiliz(?:e|es|ed|ing|ation)|delv(?:e|es|ed|ing)|showcas(?:e|es|ed|ing)|underscor(?:e|es|ed|ing)|robust|seamless(?:ly)?|tapestry|pivotal|realm|intricate|multifaceted|burgeoning|myriad|plethora)\\b"]
+    },
+    {
+      "name": "generic-temporal-opener",
+      "kind": "existence",
+      "severity": "warning",
+      "ignorecase": true,
+      "message": "Generic temporal opener '%s' - drop the throat-clearing and open on the substance.",
+      "patterns": [
+        "\\bin today'?s\\b",
+        "\\bin an? (?:era|age|world) of\\b",
+        "\\bmore than ever\\b",
+        "\\bfast-paced\\b"
+      ]
+    },
+    {
+      "name": "balancing-hedge",
+      "kind": "existence",
+      "severity": "warning",
+      "ignorecase": true,
+      "message": "Balancing hedge '%s' - the \"While X, it also/still Y\" frame is filler; lead with the point.",
+      "patterns": ["^while\\b[^.]{0,80}\\b(?:it|they) (?:also|still)\\b"]
+    },
+    {
+      "name": "staccato",
+      "kind": "staccato",
+      "severity": "warning",
+      "max_words": 5,
+      "min_run": 2,
+      "message": "Staccato: %s short sentences in a row - clipped declaratives read as manufactured drama; connect some of them or vary the length."
+    }
+  ]
+}

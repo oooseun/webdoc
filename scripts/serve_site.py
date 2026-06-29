@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import functools
 import http.server
+import ipaddress
 import json
 import os
 import signal
@@ -24,16 +25,45 @@ except Exception:  # pragma: no cover - settings module should sit beside this f
     def read_settings() -> dict:
         return {"auto_open": True}
 
+try:
+    import edit_support
+except Exception:  # pragma: no cover - editing mode is optional; absence must not break serving
+    edit_support = None  # type: ignore[assignment]
+
 
 DEFAULT_ROOT = Path(os.environ.get("AGENT_ARTIFACT_SITES", "~/agent-artifacts/sites")).expanduser()
 LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+LOOPBACK_EDIT_MESSAGE = (
+    "Editing is restricted to the local machine because it writes back to the "
+    "source file. Open this site via 127.0.0.1 or localhost on the computer "
+    "serving it to edit. Viewing and feedback work over the network; editing "
+    "does not."
+)
 DEFAULT_TTL_SECONDS = 4 * 60 * 60
 MAX_FEEDBACK_BYTES = 64 * 1024
+MAX_EDIT_BYTES = 512 * 1024
 FEEDBACK_LOCK = threading.Lock()
+EDIT_LOCK = threading.Lock()
 
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def addr_is_loopback(addr: str) -> bool:
+    """True when a raw peer IP is a loopback address (127.0.0.0/8 or ::1).
+
+    Unlike the Host header (client-supplied, spoofable), the TCP peer address is
+    the kernel's view of who connected. IPv4-mapped IPv6 (::ffff:127.0.0.1) is
+    unwrapped first."""
+    if not addr:
+        return False
+    if addr.startswith("::ffff:"):
+        addr = addr[len("::ffff:"):]
+    try:
+        return ipaddress.ip_address(addr).is_loopback
+    except ValueError:
+        return False
 
 
 def resolve_site(value: str | Path) -> Path:
@@ -119,26 +149,72 @@ class NoListingHandler(http.server.SimpleHTTPRequestHandler):
             return
         super().do_GET()
 
-    def do_POST(self) -> None:
-        parsed = urlparse(self.path)
-        if parsed.path != "/api/feedback":
-            self.send_json(404, {"error": "not_found"})
-            return
+    def _peer_is_loopback(self) -> bool:
+        """True when the connecting TCP peer is a loopback address.
+
+        This is the authoritative write-path gate: the Host header check below
+        defends DNS-rebinding but trusts client-supplied text, so under
+        --allow-lan a LAN peer can forge `Host: 127.0.0.1`. The peer address
+        cannot be forged over a real TCP connection."""
+        peer = ""
+        try:
+            peer = self.client_address[0]
+        except (AttributeError, IndexError, TypeError):
+            try:
+                peer = self.connection.getpeername()[0]
+            except Exception:
+                return False
+        return addr_is_loopback(peer)
+
+    def _host_is_loopback(self) -> bool:
+        """True when the request's Host header names a loopback address.
+
+        The write path (/api/edit) is loopback-only regardless of --allow-lan:
+        it mutates the canonical source file, so it must never be reachable from
+        the LAN even when read/feedback serving is intentionally exposed."""
+        host = self.headers.get("Host", "")
+        if host.startswith("["):  # bracketed IPv6, e.g. [::1]:8000
+            host = host[1:].split("]", 1)[0]
+        else:
+            host = host.rsplit(":", 1)[0] if host.count(":") == 1 else host
+        return host in LOOPBACK_HOSTS
+
+    def _read_json_body(self, limit: int) -> dict | None:
+        """Read + parse a size-capped JSON request body, or send the error and
+        return None. Mirrors the feedback endpoint's guards."""
         try:
             length = int(self.headers.get("content-length", "0"))
         except ValueError:
             self.send_json(400, {"error": "bad_content_length"})
-            return
+            return None
         if length <= 0:
             self.send_json(400, {"error": "empty_body"})
-            return
-        if length > MAX_FEEDBACK_BYTES:
-            self.send_json(413, {"error": "feedback_too_large", "limit_bytes": MAX_FEEDBACK_BYTES})
-            return
+            return None
+        if length > limit:
+            self.send_json(413, {"error": "body_too_large", "limit_bytes": limit})
+            return None
         try:
             payload = json.loads(self.rfile.read(length).decode("utf-8"))
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, UnicodeDecodeError):
             self.send_json(400, {"error": "bad_json"})
+            return None
+        if not isinstance(payload, dict):
+            self.send_json(400, {"error": "bad_json"})
+            return None
+        return payload
+
+    def do_POST(self) -> None:
+        parsed = urlparse(self.path)
+        if parsed.path == "/api/feedback":
+            self.handle_feedback()
+        elif parsed.path == "/api/edit":
+            self.handle_edit()
+        else:
+            self.send_json(404, {"error": "not_found"})
+
+    def handle_feedback(self) -> None:
+        payload = self._read_json_body(MAX_FEEDBACK_BYTES)
+        if payload is None:
             return
         feedback = str(payload.get("feedback", "")).strip()
         if not feedback:
@@ -156,6 +232,45 @@ class NoListingHandler(http.server.SimpleHTTPRequestHandler):
             with path.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(entry, sort_keys=True) + "\n")
         self.send_json(200, {"ok": True, "feedback_path": str(path), "received_at": entry["received_at"]})
+
+    def handle_edit(self) -> None:
+        if edit_support is None:
+            self.send_json(500, {"error": "editing_unavailable"})
+            return
+        # Gate on the real TCP peer first (unspoofable), then the Host header
+        # (DNS-rebinding defence). Both must be loopback, even under --allow-lan.
+        if not self._peer_is_loopback():
+            self.send_json(403, {"error": "loopback_only", "message": LOOPBACK_EDIT_MESSAGE})
+            return
+        if not self._host_is_loopback():
+            self.send_json(403, {"error": "loopback_only", "message": LOOPBACK_EDIT_MESSAGE})
+            return
+        payload = self._read_json_body(MAX_EDIT_BYTES)
+        if payload is None:
+            return
+        # The write target is the manifest's source_path and nothing else.
+        manifest_path = self.site_dir() / "manifest.json"
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            self.send_json(500, {"error": "no_manifest"})
+            return
+        source_path = manifest.get("source_path") if isinstance(manifest, dict) else None
+        if not source_path:
+            self.send_json(500, {"error": "no_source_path"})
+            return
+        source = Path(str(source_path))
+        if not source.is_file():
+            self.send_json(500, {"error": "source_missing"})
+            return
+        try:
+            with EDIT_LOCK:
+                status, body = edit_support.apply_edit(source, payload)
+        except Exception as exc:  # never leak a stack trace to the client
+            self.log_message("edit error: %r", exc)
+            self.send_json(500, {"error": "edit_failed"})
+            return
+        self.send_json(status, body)
 
     def list_directory(self, path: str):  # type: ignore[override]
         self.send_error(403, "Directory listing disabled")

@@ -1,0 +1,293 @@
+/* edit.css — webdoc editing mode chrome.
+   Inert in the read view: nothing here applies until edit.js adds
+   `webdoc-edit-on` to <body> (the Edit toggle). Self-contained colors so it
+   does not depend on a template's CSS variables. */
+
+.webdoc-edit-toggle {
+  position: fixed;
+  top: 14px;
+  right: 14px;
+  z-index: 1000;
+  padding: 8px 14px;
+  border: 1px solid #0f766e;
+  border-radius: 6px;
+  background: #0f766e;
+  color: #fff;
+  font: 600 0.9rem/1 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  cursor: pointer;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.18);
+}
+
+.webdoc-edit-toggle:hover {
+  background: #0b5d56;
+}
+
+/* Shown when Edit is used over a non-loopback (LAN) address. The write path is
+   loopback-only by design, so explain that clearly instead of failing vaguely. */
+.webdoc-edit-notice {
+  position: fixed;
+  top: 14px;
+  right: 14px;
+  z-index: 1002;
+  max-width: 360px;
+  padding: 14px 16px;
+  border: 1px solid #c4761c;
+  border-radius: 8px;
+  background: #fffaf2;
+  color: #5a3d12;
+  font: 0.85rem/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.22);
+}
+
+.webdoc-edit-notice strong {
+  display: block;
+  margin-bottom: 6px;
+  font-size: 0.92rem;
+  color: #7a4e12;
+}
+
+.webdoc-edit-notice p {
+  margin: 0 0 8px;
+}
+
+.webdoc-edit-notice a {
+  color: #0f766e;
+  font-weight: 600;
+  word-break: break-all;
+}
+
+.webdoc-edit-notice button {
+  padding: 6px 12px;
+  border: 1px solid #c4761c;
+  border-radius: 5px;
+  background: #f3e2cc;
+  color: #5a3d12;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.webdoc-edit-notice button:hover {
+  background: #ecd6b8;
+}
+
+/* Top banner shown while editing. */
+.webdoc-edit-banner {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 999;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 10px 16px;
+  background: #1f2528;
+  color: #f4f7f5;
+  font: 0.9rem/1.3 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.25);
+}
+
+.webdoc-edit-banner strong {
+  font-weight: 700;
+}
+
+.webdoc-edit-banner .webdoc-edit-count {
+  color: #9fe0d6;
+  font-variant-numeric: tabular-nums;
+}
+
+.webdoc-edit-banner .webdoc-spacer {
+  flex: 1;
+}
+
+.webdoc-edit-banner button {
+  padding: 6px 12px;
+  border: 1px solid #5c6a6c;
+  border-radius: 5px;
+  background: #2f383b;
+  color: #f4f7f5;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.webdoc-edit-banner button:hover {
+  background: #3d484b;
+}
+
+/* Push content down so the fixed banner does not cover the title. */
+body.webdoc-edit-on {
+  padding-top: 46px;
+}
+
+/* Editable blocks: outline on hover, clearer outline when active. */
+body.webdoc-edit-on [data-md-type] {
+  cursor: text;
+  border-radius: 3px;
+  transition: box-shadow 0.08s ease, background 0.08s ease;
+}
+
+body.webdoc-edit-on [data-md-type]:hover {
+  box-shadow: 0 0 0 2px rgba(15, 118, 110, 0.35);
+}
+
+body.webdoc-edit-on td[data-md-type]:hover,
+body.webdoc-edit-on th[data-md-type]:hover {
+  box-shadow: inset 0 0 0 2px rgba(15, 118, 110, 0.45);
+}
+
+body.webdoc-edit-on .webdoc-active,
+body.webdoc-edit-on .webdoc-active:hover {
+  box-shadow: 0 0 0 2px #0f766e;
+  background: rgba(15, 118, 110, 0.06);
+  outline: none;
+}
+
+/* Non-editable blocks: signal that they are view-only while editing. */
+body.webdoc-edit-on [data-noedit] {
+  cursor: default;
+  opacity: 0.92;
+}
+
+/* "edited" badge stamped on a block after a successful save. */
+body.webdoc-edit-on [data-webdoc-edited] {
+  position: relative;
+}
+
+body.webdoc-edit-on [data-webdoc-edited]::after {
+  content: "edited";
+  position: absolute;
+  top: -8px;
+  right: -2px;
+  padding: 1px 6px;
+  border-radius: 8px;
+  background: #0f766e;
+  color: #fff;
+  font: 700 0.62rem/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  pointer-events: none;
+}
+
+body.webdoc-edit-on td[data-webdoc-edited]::after,
+body.webdoc-edit-on th[data-webdoc-edited]::after {
+  top: 0;
+  right: 0;
+}
+
+/* Conflict (409): the block changed on disk under the open tab. */
+body.webdoc-edit-on .webdoc-conflict {
+  box-shadow: 0 0 0 2px #b91c1c !important;
+  background: rgba(185, 28, 28, 0.06);
+}
+
+/* Floating formatting toolbar. */
+.webdoc-toolbar {
+  position: absolute;
+  z-index: 1001;
+  display: flex;
+  gap: 2px;
+  padding: 4px;
+  border: 1px solid #d9dfdc;
+  border-radius: 7px;
+  background: #fff;
+  box-shadow: 0 6px 22px rgba(0, 0, 0, 0.18);
+}
+
+.webdoc-toolbar button {
+  min-width: 30px;
+  padding: 5px 9px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: #1f2528;
+  font: 0.9rem/1 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  cursor: pointer;
+}
+
+.webdoc-toolbar button:hover {
+  background: #eef3ef;
+}
+
+.webdoc-toolbar button[data-cmd="bold"] {
+  font-weight: 800;
+}
+
+.webdoc-toolbar button[data-cmd="italic"] {
+  font-style: italic;
+}
+
+.webdoc-toolbar button[data-cmd="code"] {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+/* Per-block save status pill (saving / saved / error). */
+.webdoc-status {
+  position: absolute;
+  z-index: 1001;
+  padding: 3px 9px;
+  border-radius: 10px;
+  background: #1f2528;
+  color: #fff;
+  font: 600 0.72rem/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  pointer-events: none;
+  box-shadow: 0 3px 10px rgba(0, 0, 0, 0.2);
+}
+
+.webdoc-status[data-state="saved"] {
+  background: #0f766e;
+}
+
+.webdoc-status[data-state="error"] {
+  background: #b91c1c;
+}
+
+/* Inline lint findings rendered under a saved block (advisory, non-blocking).
+   Scoped to edit mode like the "edited" badge: a lingering <ul> must not show
+   in the read view after Done, so it is hidden whenever edit mode is off. */
+body:not(.webdoc-edit-on) .webdoc-lint {
+  display: none;
+}
+
+.webdoc-lint {
+  margin: 4px 0 10px;
+  padding: 0;
+  list-style: none;
+  font: 0.8rem/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+.webdoc-lint li {
+  margin: 2px 0;
+  padding: 3px 8px;
+  border-left: 3px solid #c4761c;
+  background: #fef6ec;
+  color: #6b4413;
+}
+
+.webdoc-lint li[data-severity="error"] {
+  border-left-color: #b91c1c;
+  background: #fdecec;
+  color: #7f1d1d;
+}
+
+.webdoc-lint li[data-severity="suggestion"] {
+  border-left-color: #6b7280;
+  background: #f3f4f6;
+  color: #374151;
+}
+
+.webdoc-lint .webdoc-lint-rule {
+  font-weight: 700;
+}
+
+@media print {
+  .webdoc-edit-toggle,
+  .webdoc-edit-banner,
+  .webdoc-edit-notice,
+  .webdoc-toolbar,
+  .webdoc-status,
+  .webdoc-lint {
+    display: none !important;
+  }
+}
