@@ -30,6 +30,20 @@
   var notice = null; // LAN "editing is local-only" explainer
   var linkPopover = null; // inline link add/edit/remove UI
   var savedRange = null;  // selection saved while the link input has focus
+  var undoBtn = null;     // banner "Undo" button
+  var toastEl = null;     // transient bottom note (delete confirmation, undo errors)
+  var toastTimer = null;
+
+  // Client half of the undo stack, in lockstep with the server's per-file stack.
+  // Each entry holds the live DOM node so an undeleted block (incl. a list item
+  // in its list) comes back as the exact element, no reconstruction. LIFO.
+  var undoStack = [];
+  var UNDO_LIMIT = 200;
+  // Serialise the write path so the two stacks cannot diverge: never undo while a
+  // save is in flight (its undo entry has not been pushed yet) or while another
+  // undo is in flight (a double Cmd+Z would pop one entry but fire two requests).
+  var pendingSaves = 0;
+  var undoing = false;
 
   // ---- small DOM helpers --------------------------------------------------
 
@@ -120,12 +134,28 @@
     label.appendChild(document.createTextNode(" — saves to " + src));
     countEl = el("span", "webdoc-edit-count", "0 blocks edited");
     var spacer = el("span", "webdoc-spacer");
+    undoBtn = el("button", "webdoc-undo-btn", "Undo");
+    undoBtn.type = "button";
+    undoBtn.title = "Undo last change (Cmd/Ctrl+Z)";
+    undoBtn.disabled = true;
+    undoBtn.addEventListener("click", function () {
+      // Commit any in-progress block first, then undo the resulting newest
+      // change (so "Undo" while mid-edit reverts what you were just doing).
+      var pending = Promise.resolve();
+      if (state.active) {
+        var t = state.active;
+        state.active = null;
+        pending = Promise.resolve(commit(t));
+      }
+      pending.then(doUndo);
+    });
     var done = el("button", null, "Done");
     done.type = "button";
     done.addEventListener("click", exitEditMode);
     banner.appendChild(label);
     banner.appendChild(spacer);
     banner.appendChild(countEl);
+    banner.appendChild(undoBtn);
     banner.appendChild(done);
     document.body.appendChild(banner);
   }
@@ -134,6 +164,31 @@
     if (!countEl) return;
     var n = document.querySelectorAll("[data-webdoc-edited]").length;
     countEl.textContent = n + (n === 1 ? " block edited" : " blocks edited");
+  }
+
+  function updateUndoBtn() {
+    if (undoBtn) undoBtn.disabled = undoStack.length === 0;
+  }
+
+  function pushUndo(entry) {
+    undoStack.push(entry);
+    if (undoStack.length > UNDO_LIMIT) undoStack.shift();
+    updateUndoBtn();
+  }
+
+  // Transient bottom-centre note (block deleted, undo failed). Not a status pill:
+  // those anchor to a block, and a deleted block has no rect to anchor to.
+  function flash(msg) {
+    if (!toastEl) {
+      toastEl = el("div", "webdoc-toast");
+      document.body.appendChild(toastEl);
+    }
+    toastEl.textContent = msg;
+    toastEl.classList.add("webdoc-toast-on");
+    if (toastTimer) clearTimeout(toastTimer);
+    toastTimer = setTimeout(function () {
+      if (toastEl) toastEl.classList.remove("webdoc-toast-on");
+    }, 2600);
   }
 
   // ---- toolbar ------------------------------------------------------------
@@ -147,7 +202,7 @@
       ["strike", "S", "Strikethrough"],
       ["code", "<>", "Inline code"],
       ["link", "Link", "Link (add / edit / remove)"],
-      ["clear", "Clear", "Clear formatting"]
+      ["delete", "Delete", "Delete this block (undo with Cmd/Ctrl+Z)"]
     ];
     buttons.forEach(function (spec) {
       var b = el("button", null, spec[1]);
@@ -160,6 +215,7 @@
         ev.preventDefault();
         runCommand(spec[0]);
       });
+      if (spec[0] === "delete") toolbar.__deleteBtn = b;
       toolbar.appendChild(b);
     });
     document.body.appendChild(toolbar);
@@ -168,6 +224,12 @@
   function showToolbar(target) {
     if (!toolbar) return;
     toolbar.hidden = false;
+    // Delete removes a whole range block; it has no meaning for a table cell
+    // (removing one cell would break the row), so hide it there.
+    if (toolbar.__deleteBtn) {
+      toolbar.__deleteBtn.style.display =
+        target.dataset.mdType === "tablecell" ? "none" : "";
+    }
     var r = pageRect(target);
     // Measure, then place above the block (fall back to below near the top).
     var tw = toolbar.offsetWidth;
@@ -197,8 +259,8 @@
       toggleInlineCode();
     } else if (cmd === "link") {
       openLinkPopover();
-    } else if (cmd === "clear") {
-      clearFormatting();
+    } else if (cmd === "delete") {
+      deleteBlock();
     }
   }
 
@@ -257,24 +319,73 @@
     wrapSelection("code");
   }
 
-  // Strip inline formatting from the selection: marks via removeFormat, links
-  // via unlink, plus any <code> spans the selection touches (removeFormat keeps
-  // those). The text itself is untouched.
-  function clearFormatting() {
-    var sel = blockSelection();
-    if (!sel) return;
-    document.execCommand("removeFormat");
-    document.execCommand("unlink");
-    sel = blockSelection();
-    if (!sel || !sel.rangeCount) return;
-    var range = sel.getRangeAt(0);
-    // removeFormat leaves <code>, and does not touch <del> (what a saved-then-
-    // reloaded strikethrough renders as) nor reliably <s>/<strike>. Unwrap them
-    // explicitly so Clear works on freshly-struck and round-tripped text alike.
-    var marks = state.active.querySelectorAll("code, del, s, strike");
-    for (var i = marks.length - 1; i >= 0; i--) {
-      if (range.intersectsNode(marks[i])) unwrap(marks[i]);
-    }
+  // -- delete a whole block ------------------------------------------------
+
+  // Remove the active range block (paragraph / heading / list item) from the
+  // source. The removed DOM node is kept (off-document) on the undo stack so
+  // Cmd/Ctrl+Z restores the exact element where it was. Hash-checked server-side
+  // (409 on drift). Not available for table cells (showToolbar hides the button).
+  function deleteBlock() {
+    var target = state.active;
+    if (!target) return;
+    var type = target.dataset.mdType;
+    if (type === "tablecell") return;
+
+    // We delete the *saved* block; drop any uncommitted typing so the node we
+    // stash for undo matches the source it will be restored from.
+    target.innerHTML = state.original;
+    state.active = null;
+    deactivate(target);
+
+    var start = parseInt(target.dataset.mdStart, 10);
+    var end = parseInt(target.dataset.mdEnd, 10);
+    var prevEdited = target.hasAttribute("data-webdoc-edited");
+    var parent = target.parentNode;
+    var nextSibling = target.nextSibling;
+
+    setStatus(target, "saving", "deleting…");
+    pendingSaves++;
+    fetch("/api/edit", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        op: "delete", type: type, start: start, end: end, hash: target.dataset.mdHash
+      })
+    }).then(function (resp) {
+      return resp.json().catch(function () { return {}; }).then(function (body) {
+        return { status: resp.status, ok: resp.ok, body: body };
+      });
+    }).then(function (res) {
+      if (res.status === 409) {
+        onConflict(target, res.body); // block changed on disk; keep it, flag it
+        return;
+      }
+      if (!res.ok || !res.body || !res.body.ok) {
+        if (res.status === 403 && res.body && res.body.error === "loopback_only") {
+          showLanNotice();
+          setStatus(target, "error", "editing is local-only");
+        } else {
+          setStatus(target, "error", friendlyError(res.body));
+        }
+        return;
+      }
+      // Clear the lingering "deleting…" pill (no auto-dismiss on "saving"),
+      // then drop the node from the page but keep the reference for undo.
+      if (target.__wdStatus) { target.__wdStatus.remove(); target.__wdStatus = null; }
+      if (target.__wdLint) { target.__wdLint.remove(); target.__wdLint = null; }
+      if (parent) parent.removeChild(target);
+      shiftFollowing(end, res.body.line_delta || 0, null);
+      pushUndo({
+        label: "delete", node: target, parent: parent, nextSibling: nextSibling,
+        prevEdited: prevEdited, expectStart: start
+      });
+      updateCount();
+      flash("Block deleted. Undo with Cmd/Ctrl+Z.");
+    }).catch(function () {
+      setStatus(target, "error", "couldn't delete (offline?)");
+    }).finally(function () {
+      pendingSaves--;
+    });
   }
 
   // -- link popover (add / edit / remove) ----------------------------------
@@ -489,19 +600,20 @@
   }
 
   function commit(target) {
-    if (!target) return;
+    if (!target) return Promise.resolve();
     deactivate(target);
     if (state.cancelling) {
       state.cancelling = false;
-      return;
+      return Promise.resolve();
     }
     var htmlNow = target.innerHTML;
-    if (htmlNow === state.original) return; // nothing changed
+    if (htmlNow === state.original) return Promise.resolve(); // nothing changed
 
     // Snapshot the pre-edit HTML now: state.original is overwritten the moment
     // another block is activated, but this async save may resolve later. On any
     // failed save we restore the block to this, so it never lingers broken.
     var original = state.original;
+    var prevEdited = target.hasAttribute("data-webdoc-edited"); // for undo
     var type = target.dataset.mdType;
     var payload, oldEnd;
     if (type === "tablecell") {
@@ -525,7 +637,8 @@
     }
 
     setStatus(target, "saving", "saving…");
-    fetch("/api/edit", {
+    pendingSaves++;
+    return fetch("/api/edit", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(payload)
@@ -551,9 +664,23 @@
         return;
       }
       applyResult(target, res.body, oldEnd);
+      // Inverse for undo: restore the pre-edit HTML (and edited-badge state) of
+      // this exact node. The expect* identity lets the client confirm the server
+      // reversed THIS block before patching the node (desync backstop).
+      pushUndo({
+        label: type === "tablecell" ? "cell" : "edit",
+        node: target,
+        prevHTML: original,
+        prevEdited: prevEdited,
+        expectStart: type === "tablecell" ? null : payload.start,
+        line: type === "tablecell" ? payload.line : null,
+        cell: type === "tablecell" ? payload.cell : null
+      });
     }).catch(function () {
       target.innerHTML = original; // restore the pre-edit HTML on a failed save
       setStatus(target, "error", "couldn't save (offline?)");
+    }).finally(function () {
+      pendingSaves--;
     });
   }
 
@@ -618,6 +745,94 @@
     });
   }
 
+  // ---- undo ---------------------------------------------------------------
+
+  function setRangeAttrs(node, body) {
+    if (body.new_start != null) node.dataset.mdStart = body.new_start;
+    if (body.new_end != null) node.dataset.mdEnd = body.new_end;
+    if (body.new_hash != null) node.dataset.mdHash = body.new_hash;
+  }
+
+  function restoreEdited(node, was) {
+    if (was) node.setAttribute("data-webdoc-edited", "1");
+    else node.removeAttribute("data-webdoc-edited");
+  }
+
+  // Reverse the newest change. Calls the server (authoritative for the file),
+  // and only on success pops our parallel stack and patches the DOM. A 400
+  // (nothing to undo) or 409 (source drifted) means the stacks desynced - drop
+  // ours so a stale node ref can never be replayed against a changed page.
+  function doUndo() {
+    if (!undoStack.length) { updateUndoBtn(); return; }
+    // Stay strictly serial: a save in flight has not pushed its undo entry yet,
+    // and a second undo would pop one entry but fire two requests. Either would
+    // desync the two stacks.
+    if (undoing || pendingSaves > 0) return;
+    undoing = true;
+    fetch("/api/undo", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}"
+    }).then(function (resp) {
+      return resp.json().catch(function () { return {}; }).then(function (body) {
+        return { status: resp.status, ok: resp.ok, body: body };
+      });
+    }).then(function (res) {
+      if (!res.ok || !res.body || !res.body.ok) {
+        undoStack.length = 0;
+        updateUndoBtn();
+        if (res.status === 409) flash("Source changed on disk. Reload to edit.");
+        else if (res.status === 403) showLanNotice();
+        else if (res.status !== 400) flash("Couldn't undo.");
+        return;
+      }
+      var entry = undoStack.pop();
+      updateUndoBtn();
+      if (entry) applyUndoEntry(entry, res.body);
+    }).catch(function () {
+      flash("Couldn't undo (offline?).");
+    }).finally(function () {
+      undoing = false;
+    });
+  }
+
+  // The server reversed the newest op on the file; confirm it is the same block
+  // our popped entry refers to before patching the DOM. They can disagree only
+  // on a genuine desync (a second tab sharing the file's server stack); patching
+  // the wrong node then would scramble it, so drop our stack and ask for a reload.
+  function undoEntryMatches(entry, body) {
+    if (body.label !== entry.label) return false;
+    if (entry.label === "cell") return body.line === entry.line && body.cell === entry.cell;
+    return body.new_start === entry.expectStart; // edit + delete
+  }
+
+  function applyUndoEntry(entry, body) {
+    if (!undoEntryMatches(entry, body)) {
+      undoStack.length = 0;
+      updateUndoBtn();
+      flash("Undo got out of sync. Reload to be safe.");
+      return;
+    }
+    var node = entry.node;
+    if (entry.label === "delete") {
+      // Put the exact removed element back where it sat, then re-shift the
+      // blocks below it (they moved up when it was deleted).
+      if (entry.parent) entry.parent.insertBefore(node, entry.nextSibling || null);
+      setRangeAttrs(node, body);
+      shiftFollowing(body.shift_threshold, body.line_delta || 0, node);
+    } else if (entry.label === "cell") {
+      node.innerHTML = entry.prevHTML;
+      if (body.new_hash != null) node.dataset.mdHash = body.new_hash;
+    } else { // edit
+      node.innerHTML = entry.prevHTML;
+      setRangeAttrs(node, body);
+      shiftFollowing(body.shift_threshold, body.line_delta || 0, node);
+    }
+    restoreEdited(node, entry.prevEdited);
+    setStatus(node, "saved", "undone");
+    updateCount();
+  }
+
   // ---- mode toggle --------------------------------------------------------
 
   function enterEditMode() {
@@ -678,8 +893,19 @@
     // the capture phase (before the input's handler), so without this guard an
     // Esc/Enter in the popover would also cancel/commit the underlying block.
     if (linkPopover && !linkPopover.hidden && linkPopover.contains(ev.target)) return;
-    if (!state.on || !state.active) return;
+    if (!state.on) return;
     var mod = ev.metaKey || ev.ctrlKey;
+    // Cross-save undo only when no block is active; while a block is being
+    // edited, Cmd/Ctrl+Z stays the browser's native in-block undo. With nothing
+    // on the stack we also stand aside, so the keystroke isn't swallowed for no
+    // effect (the browser keeps its native document-level undo).
+    if (mod && !ev.shiftKey && (ev.key === "z" || ev.key === "Z") && !state.active) {
+      if (!undoStack.length) return;
+      ev.preventDefault();
+      doUndo();
+      return;
+    }
+    if (!state.active) return;
     if (ev.key === "Escape") {
       ev.preventDefault();
       cancelActive();

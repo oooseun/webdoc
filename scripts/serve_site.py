@@ -209,6 +209,8 @@ class NoListingHandler(http.server.SimpleHTTPRequestHandler):
             self.handle_feedback()
         elif parsed.path == "/api/edit":
             self.handle_edit()
+        elif parsed.path == "/api/undo":
+            self.handle_undo()
         else:
             self.send_json(404, {"error": "not_found"})
 
@@ -233,35 +235,45 @@ class NoListingHandler(http.server.SimpleHTTPRequestHandler):
                 f.write(json.dumps(entry, sort_keys=True) + "\n")
         self.send_json(200, {"ok": True, "feedback_path": str(path), "received_at": entry["received_at"]})
 
-    def handle_edit(self) -> None:
-        if edit_support is None:
-            self.send_json(500, {"error": "editing_unavailable"})
-            return
-        # Gate on the real TCP peer first (unspoofable), then the Host header
-        # (DNS-rebinding defence). Both must be loopback, even under --allow-lan.
-        if not self._peer_is_loopback():
+    def _require_loopback_edit(self) -> bool:
+        """Gate any write path on loopback: the real TCP peer first (unspoofable),
+        then the Host header (DNS-rebinding defence). Both must be loopback even
+        under --allow-lan. Sends the 403 and returns False when either fails."""
+        if not self._peer_is_loopback() or not self._host_is_loopback():
             self.send_json(403, {"error": "loopback_only", "message": LOOPBACK_EDIT_MESSAGE})
-            return
-        if not self._host_is_loopback():
-            self.send_json(403, {"error": "loopback_only", "message": LOOPBACK_EDIT_MESSAGE})
-            return
-        payload = self._read_json_body(MAX_EDIT_BYTES)
-        if payload is None:
-            return
-        # The write target is the manifest's source_path and nothing else.
+            return False
+        return True
+
+    def _edit_source(self) -> "Path | None":
+        """The one writable target: the manifest's source_path. Sends the 500 and
+        returns None when the manifest or source file is missing."""
         manifest_path = self.site_dir() / "manifest.json"
         try:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         except (FileNotFoundError, json.JSONDecodeError, OSError):
             self.send_json(500, {"error": "no_manifest"})
-            return
+            return None
         source_path = manifest.get("source_path") if isinstance(manifest, dict) else None
         if not source_path:
             self.send_json(500, {"error": "no_source_path"})
-            return
+            return None
         source = Path(str(source_path))
         if not source.is_file():
             self.send_json(500, {"error": "source_missing"})
+            return None
+        return source
+
+    def handle_edit(self) -> None:
+        if edit_support is None:
+            self.send_json(500, {"error": "editing_unavailable"})
+            return
+        if not self._require_loopback_edit():
+            return
+        payload = self._read_json_body(MAX_EDIT_BYTES)
+        if payload is None:
+            return
+        source = self._edit_source()
+        if source is None:
             return
         try:
             with EDIT_LOCK:
@@ -269,6 +281,28 @@ class NoListingHandler(http.server.SimpleHTTPRequestHandler):
         except Exception as exc:  # never leak a stack trace to the client
             self.log_message("edit error: %r", exc)
             self.send_json(500, {"error": "edit_failed"})
+            return
+        self.send_json(status, body)
+
+    def handle_undo(self) -> None:
+        if edit_support is None:
+            self.send_json(500, {"error": "editing_unavailable"})
+            return
+        if not self._require_loopback_edit():
+            return
+        # Undo needs no payload, but the client POSTs "{}" so the body guards stay
+        # uniform; read and discard it.
+        if self._read_json_body(MAX_EDIT_BYTES) is None:
+            return
+        source = self._edit_source()
+        if source is None:
+            return
+        try:
+            with EDIT_LOCK:
+                status, body = edit_support.apply_undo(source)
+        except Exception as exc:  # never leak a stack trace to the client
+            self.log_message("undo error: %r", exc)
+            self.send_json(500, {"error": "undo_failed"})
             return
         self.send_json(status, body)
 

@@ -76,8 +76,19 @@ def _atomic_write_text(path: Path, text: str) -> None:
 
 
 def _write_lines(path: Path, lines: list[str], trailing_newline: bool, newline: str = "\n") -> None:
+    # A lines list ending in "" (a trailing blank line) is only representable with
+    # a final newline: ["A", ""] must serialize as "A\n\n", because "A\n" re-reads
+    # as ["A"] - silently losing the blank line and tripping undo's bounds check.
+    # This is the no-trailing-newline sibling of the empty-doc case below: deleting
+    # the last block of a file with no final newline leaves a trailing blank, and
+    # without this coercion the block would be dropped and its undo would 409.
+    if lines and lines[-1] == "":
+        trailing_newline = True
     text = newline.join(lines)
-    if trailing_newline:
+    # An empty block list is an empty document (zero bytes), never a lone blank
+    # line: writing "\n" here would make deleting the only block irreversible
+    # (undo would then read [""] and restore one line too many).
+    if trailing_newline and lines:
         text += newline
     _atomic_write_text(path, text)
 
@@ -190,6 +201,62 @@ def check_overrides(source_path: str | Path, block_markdown: str) -> bool:
     return any(entry.get("content_hash") == target for entry in read_ledger(source_path))
 
 
+def _drop_ledger_in_range(source_path: str | Path, start: int, end: int) -> None:
+    """Drop ledger entries for range blocks fully inside [start, end].
+
+    Called on delete: a removed block's override record is now meaningless. Entry
+    line numbers are advisory (check_overrides keys on content_hash), so we only
+    prune what the delete clearly removed and leave the rest untouched."""
+    ledger = read_ledger(source_path)
+    kept = [
+        e for e in ledger
+        if not (
+            e.get("type") in RANGE_TYPES
+            and isinstance(e.get("start"), int)
+            and isinstance(e.get("end"), int)
+            and start <= e["start"] and e["end"] <= end
+        )
+    ]
+    if len(kept) != len(ledger):
+        _atomic_write_text(ledger_path(source_path), json.dumps(kept, indent=2, sort_keys=True) + "\n")
+
+
+# --------------------------------------------------------------------------- #
+# Session undo stack
+# --------------------------------------------------------------------------- #
+#
+# Editing mode supports undo (Cmd/Ctrl+Z and the banner button). Every mutating
+# op (edit, delete, cell edit) pushes an inverse *source splice* onto a per-file
+# LIFO stack; apply_undo pops the newest and replays it against the file. Because
+# undo is strictly LIFO, the splice indices recorded at push time are still valid
+# when popped: reversing op N restores the file to its state just before N, which
+# is exactly when op N-1 was recorded. The stack lives in this process only - a
+# within-session affordance; a server restart simply empties it, and the client
+# reconciles (a 400 nothing_to_undo / 409 desync clears its parallel stack).
+
+_UNDO: dict[str, list[dict]] = {}
+_UNDO_LIMIT = 200  # bound memory; the oldest entries fall off the bottom
+
+
+def _undo_key(source_path: str | Path) -> str:
+    return str(Path(source_path))
+
+
+def _push_undo(source_path: str | Path, entry: dict) -> None:
+    stack = _UNDO.setdefault(_undo_key(source_path), [])
+    stack.append(entry)
+    if len(stack) > _UNDO_LIMIT:
+        del stack[0]
+
+
+def undo_depth(source_path: str | Path) -> int:
+    return len(_UNDO.get(_undo_key(source_path), []))
+
+
+def clear_undo(source_path: str | Path) -> None:
+    _UNDO.pop(_undo_key(source_path), None)
+
+
 # --------------------------------------------------------------------------- #
 # The edit round-trip
 # --------------------------------------------------------------------------- #
@@ -199,9 +266,18 @@ def apply_edit(source_path: str | Path, payload: dict) -> tuple[int, dict]:
 
     Returns (http_status, json_body). Never raises on bad input - validation
     failures map to 400/409. A 409 means the source drifted under the open tab
-    (hash mismatch); nothing is written."""
+    (hash mismatch); nothing is written.
+
+    `op` selects the operation: the default "edit" replaces a block's text;
+    "delete" removes a whole range block (paragraph/heading/listitem)."""
+    op = str(payload.get("op", "edit"))
     btype = str(payload.get("type", ""))
-    if btype not in ALL_TYPES:
+    if op == "delete":
+        # Delete is range-only: a single table cell cannot be removed without
+        # breaking the row (row/column delete is a separate feature).
+        if btype not in RANGE_TYPES:
+            return 400, {"error": "bad_type"}
+    elif btype not in ALL_TYPES:
         return 400, {"error": "bad_type"}
 
     source_path = Path(source_path)
@@ -215,6 +291,9 @@ def apply_edit(source_path: str | Path, payload: dict) -> tuple[int, dict]:
     newline = "\r\n" if "\r\n" in text else "\n"
     trailing_newline = text.endswith("\n")
     lines = text.splitlines()
+
+    if op == "delete":
+        return _apply_delete(source_path, lines, trailing_newline, payload, btype, newline)
 
     flat = flatten(html_to_markdown(str(payload.get("html", ""))))
 
@@ -249,6 +328,22 @@ def _apply_range(
     new_block = rewrap_range(btype, original_slice, flat)
     new_lines = lines[:start - 1] + new_block + lines[end:]
     _write_lines(source_path, new_lines, trailing_newline, newline)
+
+    # Inverse for undo: at the block's start, drop the lines we just wrote and
+    # put the original slice back. Valid because undo is LIFO (see _UNDO).
+    # `expect` is the content undo will remove (the lines we wrote): undo verifies
+    # the file still holds exactly this before splicing, so an out-of-band edit
+    # cannot make a stale-but-in-bounds splice clobber the wrong lines. `trailing`
+    # restores the file's exact trailing-newline state.
+    _push_undo(source_path, {
+        "label": "edit",
+        "at": start - 1,
+        "remove": len(new_block),
+        "insert": original_slice,
+        "expect": new_block,
+        "trailing": trailing_newline,
+        "newline": newline,
+    })
 
     new_start = start
     new_end = start + len(new_block) - 1
@@ -309,6 +404,20 @@ def _apply_cell(
     new_lines = lines[:line - 1] + [new_row] + lines[line:]
     _write_lines(source_path, new_lines, trailing_newline, newline)
 
+    # Inverse for undo: restore the original row (carries line + cell so undo can
+    # recompute this cell's hash/html, not the whole row's).
+    _push_undo(source_path, {
+        "label": "cell",
+        "at": line - 1,
+        "remove": 1,
+        "insert": [row],
+        "expect": [new_row],
+        "trailing": trailing_newline,
+        "newline": newline,
+        "line": line,
+        "cell": cell,
+    })
+
     # Recompute from the written row so the client's stored hash matches exactly
     # what a fresh create_site build would emit for this cell.
     written = split_table_row(new_row)
@@ -335,3 +444,158 @@ def _apply_cell(
         "line_delta": 0,
         "lint": lint_block(cell_text),
     }
+
+
+def _apply_delete(
+    source_path: Path,
+    lines: list[str],
+    trailing_newline: bool,
+    payload: dict,
+    btype: str,
+    newline: str = "\n",
+) -> tuple[int, dict]:
+    """Remove a whole range block (paragraph/heading/listitem) from the source.
+
+    Hash-checked like an edit (409 on drift); the removed slice is pushed onto
+    the undo stack so the block can be restored verbatim. Returns the negative
+    line_delta so the client can shift the ranges of every following block."""
+    try:
+        start = int(payload["start"])
+        end = int(payload["end"])
+    except (KeyError, TypeError, ValueError):
+        return 400, {"error": "bad_range"}
+    if start < 1 or end < start or end > len(lines):
+        return 409, dict(_STALE)
+
+    original_slice = lines[start - 1:end]
+    if block_hash("\n".join(original_slice)) != str(payload.get("hash", "")):
+        return 409, dict(_STALE)
+
+    new_lines = lines[:start - 1] + lines[end:]
+    _write_lines(source_path, new_lines, trailing_newline, newline)
+
+    # Inverse for undo: re-insert the removed slice at the same position. remove=0
+    # so there is no removed content to guard; instead `anchor` records the line
+    # that will sit at the splice point after deletion (None if the block was at
+    # end-of-file), so undo can confirm the position hasn't shifted out from under
+    # it before re-inserting. `trailing`/`newline` restore the file's exact line-
+    # ending state (matters when the only block is deleted -> empty file).
+    #
+    # Ledger note: _drop_ledger_in_range removes this block's override record and
+    # undo does not restore it. The ledger is content-hash keyed and advisory
+    # (check_overrides), so a delete-then-undo'd block that had a prior human edit
+    # loses its anti-clobber record (the client still restores the visible badge).
+    # Accepted residual, same class as the stale entry an edit-undo leaves behind.
+    _push_undo(source_path, {
+        "label": "delete",
+        "at": start - 1,
+        "remove": 0,
+        "insert": original_slice,
+        "expect": [],
+        "anchor": lines[end] if end < len(lines) else None,
+        "trailing": trailing_newline,
+        "newline": newline,
+    })
+    _drop_ledger_in_range(source_path, start, end)
+
+    return 200, {
+        "ok": True,
+        "op": "delete",
+        "type": btype,
+        "start": start,
+        "end": end,
+        "line_delta": -(end - start + 1),
+    }
+
+
+def apply_undo(source_path: str | Path) -> tuple[int, dict]:
+    """Reverse the most recent mutating edit on this source (LIFO).
+
+    Pops the newest inverse splice and replays it against the file. Returns the
+    affected block's fresh identity (range + hash, or cell hash) and line_delta
+    so the client can patch the DOM and re-shift following blocks. A 400 means
+    nothing is left to undo; a 409 means the source drifted out from under the
+    stack (the stack is then dropped, never replayed against a changed file)."""
+    key = _undo_key(source_path)
+    stack = _UNDO.get(key)
+    if not stack:
+        return 400, {"error": "nothing_to_undo", "message": "nothing to undo"}
+
+    entry = stack[-1]  # peek; only pop after the write succeeds
+    source_path = Path(source_path)
+    try:
+        with source_path.open("r", encoding="utf-8", errors="replace", newline="") as fh:
+            text = fh.read()
+    except OSError as exc:
+        return 500, {"error": "source_unreadable", "detail": str(exc)}
+    newline = "\r\n" if "\r\n" in text else "\n"
+    trailing_newline = text.endswith("\n")
+    lines = text.splitlines()
+
+    at = int(entry["at"])
+    remove = int(entry["remove"])
+    insert = list(entry["insert"])
+    expect = entry.get("expect")
+    # Reject a stale splice. The bounds check catches a file that shrank; the
+    # content check (the lines undo is about to remove must still be exactly what
+    # this op wrote) catches a same-length out-of-band edit that the bounds check
+    # would miss - parity with the 409 hash-check that guards edit/delete. For an
+    # insert-only (delete) undo there is no removed content, so `anchor` guards the
+    # position instead: the line that should sit at the splice point must still be
+    # there (or the file must still end there), else an out-of-band line shift
+    # would re-insert the block in the wrong place. Either way the whole stack is
+    # dropped, never replayed against a changed file.
+    desynced = at < 0 or remove < 0 or at + remove > len(lines)
+    if not desynced and expect is not None and lines[at:at + remove] != list(expect):
+        desynced = True
+    if not desynced and "anchor" in entry:
+        anchor = entry["anchor"]
+        if anchor is None:
+            desynced = at != len(lines)  # block was at EOF; undo must append there
+        else:
+            desynced = at >= len(lines) or lines[at] != anchor
+    if desynced:
+        clear_undo(source_path)
+        return 409, {"error": "undo_desynced", "message": "source changed — reload to edit"}
+
+    # Restore the file's exact line-ending state. `newline`/`trailing` are recorded
+    # per op because apply_undo re-reads the (possibly emptied) file, where the
+    # style can no longer be re-detected - e.g. undoing the delete of the only
+    # block: the file is "" so a fresh detect would default to LF and drop CRLF.
+    target_trailing = bool(entry.get("trailing", trailing_newline))
+    target_newline = entry.get("newline", newline)
+    new_lines = lines[:at] + insert + lines[at + remove:]
+    _write_lines(source_path, new_lines, target_trailing, target_newline)
+    stack.pop()
+    if not stack:
+        clear_undo(source_path)
+
+    label = entry.get("label", "edit")
+    body = {
+        "ok": True,
+        "label": label,
+        "line_delta": len(insert) - remove,
+        # Following blocks (start past here) shifted by line_delta; the affected
+        # block itself is patched by the client from new_start/new_end below.
+        "shift_threshold": at + remove,
+        "remaining": undo_depth(source_path),
+    }
+    if label == "cell":
+        line = int(entry.get("line", at + 1))
+        cell = int(entry.get("cell", 0))
+        written = split_table_row(insert[0]) if insert else []
+        canon = written[cell] if cell < len(written) else ""
+        _, cell_text = cell_marker(canon)
+        body.update({
+            "line": line,
+            "cell": cell,
+            "new_hash": block_hash(canon),
+            "new_html": inline_md(cell_text),
+        })
+    else:
+        body.update({
+            "new_start": at + 1,
+            "new_end": at + len(insert),
+            "new_hash": block_hash("\n".join(insert)),
+        })
+    return 200, body

@@ -116,6 +116,15 @@
   background: #3d484b;
 }
 
+.webdoc-edit-banner button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.webdoc-edit-banner button:disabled:hover {
+  background: #2f383b;
+}
+
 /* Push content down so the fixed banner does not cover the title. */
 body.webdoc-edit-on {
   padding-top: 46px;
@@ -235,9 +244,19 @@ body.webdoc-edit-on .webdoc-conflict {
   text-decoration: line-through;
 }
 
-.webdoc-toolbar button[data-cmd="clear"],
+.webdoc-toolbar button[data-cmd="delete"],
 .webdoc-toolbar button[data-cmd="link"] {
   font-size: 0.78rem;
+}
+
+/* Delete is destructive: tint it red so it reads apart from the formatting
+   buttons. (Undo, in the banner, is the safety net.) */
+.webdoc-toolbar button[data-cmd="delete"] {
+  color: #b91c1c;
+}
+
+.webdoc-toolbar button[data-cmd="delete"]:hover {
+  background: #fdecec;
 }
 
 /* Inline link editor (add / edit / remove), shown by the Link button. */
@@ -314,6 +333,30 @@ body.webdoc-edit-on .webdoc-conflict {
   background: #b91c1c;
 }
 
+/* Transient bottom-centre note: block-deleted confirmation, undo errors. Unlike
+   the status pill it is not anchored to a block (a deleted block has no rect). */
+.webdoc-toast {
+  position: fixed;
+  left: 50%;
+  bottom: 22px;
+  transform: translateX(-50%) translateY(8px);
+  z-index: 1003;
+  padding: 9px 16px;
+  border-radius: 8px;
+  background: #1f2528;
+  color: #f4f7f5;
+  font: 600 0.85rem/1.3 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.28);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.16s ease, transform 0.16s ease;
+}
+
+.webdoc-toast.webdoc-toast-on {
+  opacity: 1;
+  transform: translateX(-50%) translateY(0);
+}
+
 /* Inline lint findings rendered under a saved block (advisory, non-blocking).
    Scoped to edit mode like the "edited" badge: a lingering <ul> must not show
    in the read view after Done, so it is hidden whenever edit mode is off. */
@@ -359,6 +402,7 @@ body:not(.webdoc-edit-on) .webdoc-lint {
   .webdoc-toolbar,
   .webdoc-link-pop,
   .webdoc-status,
+  .webdoc-toast,
   .webdoc-lint {
     display: none !important;
   }

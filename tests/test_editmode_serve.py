@@ -79,6 +79,22 @@ def _():
     assert h.captured.get("status") == 403, h.captured
 
 
+@test("/api/undo is loopback-guarded too (non-loopback peer -> 403)")
+def _():
+    # Undo also mutates the source file, so it must carry the same write-guard.
+    h = make_handler("192.168.1.50", "127.0.0.1:8000")
+    h.handle_undo()
+    assert h.captured.get("status") == 403, h.captured
+    assert h.captured["payload"].get("error") == "loopback_only", h.captured
+
+
+@test("/api/undo rejects a loopback peer with a non-loopback Host (DNS rebinding)")
+def _():
+    h = make_handler("127.0.0.1", "evil.example.com")
+    h.handle_undo()
+    assert h.captured.get("status") == 403, h.captured
+
+
 def main() -> int:
     print(f"editmode serve-guard suite  ({len(TESTS)} tests)")
     print(f"  modules: {SCRIPTS}")

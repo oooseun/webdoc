@@ -584,6 +584,242 @@ def _():
     assert b"\nEdited" not in raw and b"Edited first.\r\n" in raw, f"edited line uses CRLF: {raw!r}"
 
 
+# --------------------------------------------------------------------------- #
+# Block delete (op="delete") + session undo
+# --------------------------------------------------------------------------- #
+
+@test("delete: removes a range block, shifts the rest, returns negative delta")
+def _():
+    text = "Para one.\n\nPara two.\n\nPara three.\n"
+    src = write_md(text)
+    status, body = edit_support.apply_edit(src, {
+        "op": "delete", "type": "paragraph", "start": 3, "end": 3,
+        "hash": slice_hash(text, 3, 3)})
+    eq(status, 200, "status")
+    eq(body["op"], "delete", "op echoed")
+    eq(body["line_delta"], -1, "one line removed")
+    eq(src.read_text(encoding="utf-8"), "Para one.\n\n\nPara three.\n", "middle block gone")
+
+
+@test("delete: 409 on a stale hash, nothing removed")
+def _():
+    text = "Keep me.\n\nDelete target.\n"
+    src = write_md(text)
+    status, body = edit_support.apply_edit(src, {
+        "op": "delete", "type": "paragraph", "start": 3, "end": 3, "hash": "deadbeef"})
+    eq(status, 409, "status")
+    eq(body["error"], "stale_block", "error")
+    eq(src.read_text(encoding="utf-8"), text, "unchanged")
+
+
+@test("delete: a table cell cannot be deleted (bad_type), file unchanged")
+def _():
+    text = "| A | B |\n| --- | --- |\n| x | y |\n"
+    src = write_md(text)
+    status, body = edit_support.apply_edit(src, {
+        "op": "delete", "type": "tablecell", "line": 3, "cell": 0, "hash": "x"})
+    eq(status, 400, "status")
+    eq(body["error"], "bad_type", "error")
+    eq(src.read_text(encoding="utf-8"), text, "unchanged")
+
+
+@test("delete: drops the deleted block's ledger entry")
+def _():
+    text = "Edit me.\n\nKeep me.\n"
+    src = write_md(text)
+    edit_support.apply_edit(src, {
+        "type": "paragraph", "start": 1, "end": 1, "hash": slice_hash(text, 1, 1), "html": "Edited."})
+    eq(len(edit_support.read_ledger(src)), 1, "one ledger entry after the edit")
+    t1 = src.read_text(encoding="utf-8")
+    edit_support.apply_edit(src, {
+        "op": "delete", "type": "paragraph", "start": 1, "end": 1, "hash": slice_hash(t1, 1, 1)})
+    eq(edit_support.read_ledger(src), [], "ledger entry for the deleted block is dropped")
+
+
+@test("undo: restores a deleted block verbatim and re-shifts ranges")
+def _():
+    text = "Para one.\n\nPara two.\n\nPara three.\n"
+    src = write_md(text)
+    edit_support.apply_edit(src, {
+        "op": "delete", "type": "paragraph", "start": 3, "end": 3, "hash": slice_hash(text, 3, 3)})
+    status, body = edit_support.apply_undo(src)
+    eq(status, 200, "status")
+    eq(body["label"], "delete", "label")
+    eq(body["line_delta"], 1, "one line restored")
+    eq(body["new_start"], 3, "restored at its original start")
+    eq(body["new_end"], 3, "single line")
+    eq(src.read_text(encoding="utf-8"), text, "file restored exactly")
+    eq(body["new_hash"], slice_hash(text, 3, 3), "hash matches the restored block")
+
+
+@test("undo: reverses a text edit (content, range, and added line restored)")
+def _():
+    text = "First line.\nstill same paragraph.\n\nSecond para.\n"
+    src = write_md(text)
+    edit_support.apply_edit(src, {
+        "type": "paragraph", "start": 1, "end": 2, "hash": slice_hash(text, 1, 2),
+        "html": "<strong>New</strong> body."})
+    status, body = edit_support.apply_undo(src)
+    eq(status, 200, "status")
+    eq(body["label"], "edit", "label")
+    eq(src.read_text(encoding="utf-8"), text, "the two-line paragraph is restored")
+    eq(body["new_start"], 1, "new_start")
+    eq(body["new_end"], 2, "new_end (two lines back)")
+    eq(body["line_delta"], 1, "the collapsed line is restored (1 -> 2)")
+
+
+@test("undo: nothing to undo -> 400")
+def _():
+    src = write_md("Just one paragraph.\n")
+    status, body = edit_support.apply_undo(src)
+    eq(status, 400, "status")
+    eq(body["error"], "nothing_to_undo", "error")
+
+
+@test("undo: LIFO - reverses the delete first, then the earlier edit")
+def _():
+    text = "Alpha.\n\nBravo.\n\nCharlie.\n"
+    src = write_md(text)
+    edit_support.apply_edit(src, {
+        "type": "paragraph", "start": 1, "end": 1, "hash": slice_hash(text, 1, 1), "html": "Alpha edited."})
+    t1 = src.read_text(encoding="utf-8")
+    edit_support.apply_edit(src, {
+        "op": "delete", "type": "paragraph", "start": 5, "end": 5, "hash": slice_hash(t1, 5, 5)})
+    s1, b1 = edit_support.apply_undo(src)
+    eq(s1, 200, "undo1 status")
+    eq(b1["label"], "delete", "undo1 reverses the delete (newest)")
+    eq(src.read_text(encoding="utf-8"), t1, "back to the post-edit state")
+    s2, b2 = edit_support.apply_undo(src)
+    eq(s2, 200, "undo2 status")
+    eq(b2["label"], "edit", "undo2 reverses the earlier edit")
+    eq(src.read_text(encoding="utf-8"), text, "back to the original")
+    s3, _ = edit_support.apply_undo(src)
+    eq(s3, 400, "undo3: nothing left")
+
+
+@test("undo: reverses a table cell edit (cell hash + html recomputed)")
+def _():
+    text = "| A | B |\n| --- | --- |\n| x | y |\n"
+    src = write_md(text)
+    field = create_site.split_table_row(text.splitlines()[2])[0]  # "x"
+    edit_support.apply_edit(src, {
+        "type": "tablecell", "line": 3, "cell": 0, "hash": block_hash(field), "html": "z"})
+    eq(src.read_text(encoding="utf-8"), "| A | B |\n| --- | --- |\n| z | y |\n", "cell edited")
+    status, body = edit_support.apply_undo(src)
+    eq(status, 200, "status")
+    eq(body["label"], "cell", "label")
+    eq(body["line"], 3, "line")
+    eq(body["cell"], 0, "cell")
+    eq(body["line_delta"], 0, "a cell undo never shifts lines")
+    eq(src.read_text(encoding="utf-8"), text, "the row is restored")
+    restored = create_site.split_table_row(src.read_text(encoding="utf-8").splitlines()[2])[0]
+    eq(body["new_hash"], block_hash(restored), "hash matches the restored cell")
+    eq(body["new_html"], "x", "restored cell html")
+
+
+@test("undo: refuses and drops the stack when the source drifted (409)")
+def _():
+    text = "Alpha.\n\nBravo.\n\nCharlie.\n"
+    src = write_md(text)
+    edit_support.apply_edit(src, {
+        "op": "delete", "type": "paragraph", "start": 5, "end": 5, "hash": slice_hash(text, 5, 5)})
+    # The source shrinks under the stack (fewer lines than the stale splice needs).
+    src.write_text("x\n", encoding="utf-8")
+    status, body = edit_support.apply_undo(src)
+    eq(status, 409, "status")
+    eq(body["error"], "undo_desynced", "error")
+    s2, b2 = edit_support.apply_undo(src)
+    eq(s2, 400, "the stack was dropped, nothing left to undo")
+    eq(b2["error"], "nothing_to_undo", "error")
+
+
+@test("undo: deleting the only block round-trips to exact bytes (empty doc)")
+def _():
+    text = "Solo paragraph.\n"
+    src = write_md(text)
+    edit_support.apply_edit(src, {
+        "op": "delete", "type": "paragraph", "start": 1, "end": 1, "hash": slice_hash(text, 1, 1)})
+    eq(src.read_text(encoding="utf-8"), "", "deleting the only block empties the file, not a blank line")
+    status, _ = edit_support.apply_undo(src)
+    eq(status, 200, "undo status")
+    eq(src.read_text(encoding="utf-8"), text, "restored to the exact original bytes")
+
+
+@test("undo: a same-length out-of-band edit is caught (409 desync, content kept)")
+def _():
+    text = "AAA\nBBB\nCCC\n"
+    src = write_md(text)
+    edit_support.apply_edit(src, {
+        "type": "paragraph", "start": 2, "end": 2, "hash": slice_hash(text, 2, 2), "html": "XXX"})
+    eq(src.read_text(encoding="utf-8"), "AAA\nXXX\nCCC\n", "edited")
+    # An external writer changes the SAME line, SAME length, under the stack: the
+    # bounds check would miss this; the content guard must catch it.
+    src.write_text("AAA\nZZZ\nCCC\n", encoding="utf-8")
+    status, body = edit_support.apply_undo(src)
+    eq(status, 409, "content guard catches the drift")
+    eq(body["error"], "undo_desynced", "error")
+    eq(src.read_text(encoding="utf-8"), "AAA\nZZZ\nCCC\n", "the external content is NOT clobbered")
+    s2, _ = edit_support.apply_undo(src)
+    eq(s2, 400, "the stack was dropped after the desync")
+
+
+@test("undo: deleting the only block preserves CRLF on restore (empty-file edge)")
+def _():
+    text = "Solo CRLF para.\r\n"
+    src = write_md(text)
+    edit_support.apply_edit(src, {
+        "op": "delete", "type": "paragraph", "start": 1, "end": 1, "hash": slice_hash(text, 1, 1)})
+    eq(src.read_bytes(), b"", "deleting the only block empties the file")
+    status, _ = edit_support.apply_undo(src)
+    eq(status, 200, "undo status")
+    # The file is empty when undo runs, so the CRLF style cannot be re-detected;
+    # it must come from the recorded undo entry, not default to LF.
+    eq(src.read_bytes(), b"Solo CRLF para.\r\n", "CRLF restored exactly, not flipped to LF")
+
+
+@test("undo: deleting the last block of a no-trailing-newline file round-trips")
+def _():
+    text = "A\n\nB"  # two paragraphs, NO final newline (editor/agent-written files)
+    src = write_md(text)
+    edit_support.apply_edit(src, {
+        "op": "delete", "type": "paragraph", "start": 3, "end": 3, "hash": slice_hash(text, 3, 3)})
+    # The blank separator must be preserved (not silently dropped to "A\n"), and
+    # the file must stay representable so undo can find its splice point.
+    eq(src.read_text(encoding="utf-8"), "A\n\n", "blank separator kept after deleting the last block")
+    status, _ = edit_support.apply_undo(src)
+    eq(status, 200, "undo succeeds (no false 'source changed' 409)")
+    eq(src.read_text(encoding="utf-8"), "A\n\nB", "restored to exact bytes, no trailing newline added")
+
+
+@test("undo: delete-undo rejects an out-of-band line shift (position guard)")
+def _():
+    text = "L1\nL2\nL3\n"
+    src = write_md(text)
+    edit_support.apply_edit(src, {
+        "op": "delete", "type": "paragraph", "start": 2, "end": 2, "hash": slice_hash(text, 2, 2)})
+    eq(src.read_text(encoding="utf-8"), "L1\nL3\n", "L2 deleted")
+    # An external writer prepends a line: the splice point shifts under the stack.
+    # remove=0 means no content to compare, so the anchor (the line that should be
+    # at the splice point) must catch it.
+    src.write_text("NEW\nL1\nL3\n", encoding="utf-8")
+    status, body = edit_support.apply_undo(src)
+    eq(status, 409, "anchor catches the shift")
+    eq(body["error"], "undo_desynced", "error")
+    eq(src.read_text(encoding="utf-8"), "NEW\nL1\nL3\n", "block NOT misplaced or clobbered")
+
+
+@test("undo: an edit then undo preserves CRLF line endings")
+def _():
+    text = "First line.\r\nSecond line.\r\n"
+    src = write_md(text)
+    edit_support.apply_edit(src, {
+        "type": "paragraph", "start": 1, "end": 1, "hash": slice_hash(text, 1, 1), "html": "Edited first."})
+    status, _ = edit_support.apply_undo(src)
+    eq(status, 200, "status")
+    raw = src.read_bytes()
+    assert b"\r\n" in raw and b"\nFirst" not in raw, f"CRLF preserved through undo: {raw!r}"
+
+
 def main() -> int:
     print(f"editmode test suite  ({len(TESTS)} tests)")
     print(f"  modules: {SCRIPTS}")
