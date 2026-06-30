@@ -28,6 +28,8 @@
   var countEl = null;
   var toolbar = null;
   var notice = null; // LAN "editing is local-only" explainer
+  var linkPopover = null; // inline link add/edit/remove UI
+  var savedRange = null;  // selection saved while the link input has focus
 
   // ---- small DOM helpers --------------------------------------------------
 
@@ -142,8 +144,10 @@
     var buttons = [
       ["bold", "B", "Bold (Cmd/Ctrl+B)"],
       ["italic", "I", "Italic (Cmd/Ctrl+I)"],
+      ["strike", "S", "Strikethrough"],
       ["code", "<>", "Inline code"],
-      ["link", "Link", "Link"]
+      ["link", "Link", "Link (add / edit / remove)"],
+      ["clear", "Clear", "Clear formatting"]
     ];
     buttons.forEach(function (spec) {
       var b = el("button", null, spec[1]);
@@ -187,17 +191,49 @@
       document.execCommand("bold");
     } else if (cmd === "italic") {
       document.execCommand("italic");
+    } else if (cmd === "strike") {
+      document.execCommand("strikeThrough");
     } else if (cmd === "code") {
-      wrapSelection("code");
+      toggleInlineCode();
     } else if (cmd === "link") {
-      var url = window.prompt("Link URL:", "https://");
-      if (url) wrapLink(url.trim());
+      openLinkPopover();
+    } else if (cmd === "clear") {
+      clearFormatting();
     }
   }
 
-  function wrapSelection(tagName) {
+  // -- selection helpers, scoped to the active block -----------------------
+
+  // The Selection, but only when its range lives inside the block being edited.
+  function blockSelection() {
     var sel = window.getSelection();
-    if (!sel || !sel.rangeCount) return;
+    if (!sel || !sel.rangeCount) return null;
+    var r = sel.getRangeAt(0);
+    if (state.active && state.active.contains(r.commonAncestorContainer)) return sel;
+    return null;
+  }
+
+  // Nearest ancestor element with this tag, never escaping the active block.
+  function closestTag(node, tagName) {
+    tagName = tagName.toUpperCase();
+    while (node && node !== state.active) {
+      if (node.nodeType === 1 && node.tagName === tagName) return node;
+      node = node.parentNode;
+    }
+    return null;
+  }
+
+  // Replace an element with its own children (drop the tag, keep the content).
+  function unwrap(elemt) {
+    var parent = elemt.parentNode;
+    if (!parent) return;
+    while (elemt.firstChild) parent.insertBefore(elemt.firstChild, elemt);
+    parent.removeChild(elemt);
+  }
+
+  function wrapSelection(tagName) {
+    var sel = blockSelection();
+    if (!sel) return;
     var range = sel.getRangeAt(0);
     if (range.collapsed) return;
     var wrapper = document.createElement(tagName);
@@ -209,6 +245,145 @@
       range.insertNode(wrapper);
     }
     sel.removeAllRanges();
+  }
+
+  // Inline code toggles: a selection inside a <code> unwraps it; otherwise the
+  // selection is wrapped. (Bold/italic/strike already toggle via execCommand.)
+  function toggleInlineCode() {
+    var sel = blockSelection();
+    if (!sel) return;
+    var code = closestTag(sel.anchorNode, "code") || closestTag(sel.focusNode, "code");
+    if (code) { unwrap(code); return; }
+    wrapSelection("code");
+  }
+
+  // Strip inline formatting from the selection: marks via removeFormat, links
+  // via unlink, plus any <code> spans the selection touches (removeFormat keeps
+  // those). The text itself is untouched.
+  function clearFormatting() {
+    var sel = blockSelection();
+    if (!sel) return;
+    document.execCommand("removeFormat");
+    document.execCommand("unlink");
+    sel = blockSelection();
+    if (!sel || !sel.rangeCount) return;
+    var range = sel.getRangeAt(0);
+    // removeFormat leaves <code>, and does not touch <del> (what a saved-then-
+    // reloaded strikethrough renders as) nor reliably <s>/<strike>. Unwrap them
+    // explicitly so Clear works on freshly-struck and round-tripped text alike.
+    var marks = state.active.querySelectorAll("code, del, s, strike");
+    for (var i = marks.length - 1; i >= 0; i--) {
+      if (range.intersectsNode(marks[i])) unwrap(marks[i]);
+    }
+  }
+
+  // -- link popover (add / edit / remove) ----------------------------------
+
+  // Mirror the server + html2md scheme policy: drop control/space chars, then
+  // refuse javascript:/data:/vbscript:. The server strips these on save too;
+  // this is just so the editor never shows a link it would then silently drop.
+  function isUnsafeScheme(url) {
+    var probe = url.replace(/[\u0000-\u0020]+/g, "").toLowerCase();
+    return probe.lastIndexOf("javascript:", 0) === 0 ||
+           probe.lastIndexOf("data:", 0) === 0 ||
+           probe.lastIndexOf("vbscript:", 0) === 0;
+  }
+
+  function buildLinkPopover() {
+    linkPopover = el("div", "webdoc-link-pop");
+    linkPopover.hidden = true;
+    var input = el("input", "webdoc-link-input");
+    input.type = "text";
+    input.placeholder = "https://…";
+    var apply = el("button", "webdoc-link-apply", "Apply");
+    var remove = el("button", "webdoc-link-remove", "Remove");
+    var cancel = el("button", "webdoc-link-cancel", "Cancel");
+    [apply, remove, cancel].forEach(function (b) {
+      b.type = "button";
+      // A mousedown inside the popover must not blur/commit the active block.
+      b.addEventListener("mousedown", function (ev) { ev.preventDefault(); });
+    });
+    apply.addEventListener("click", function () { applyLink(input.value); });
+    remove.addEventListener("click", removeLink);
+    cancel.addEventListener("click", closeLinkPopover);
+    input.addEventListener("keydown", function (ev) {
+      if (ev.key === "Enter") { ev.preventDefault(); applyLink(input.value); }
+      else if (ev.key === "Escape") { ev.preventDefault(); closeLinkPopover(); }
+    });
+    linkPopover.appendChild(input);
+    linkPopover.appendChild(apply);
+    linkPopover.appendChild(remove);
+    linkPopover.appendChild(cancel);
+    linkPopover.__input = input;
+    linkPopover.__remove = remove;
+    document.body.appendChild(linkPopover);
+  }
+
+  function openLinkPopover() {
+    var sel = blockSelection();
+    if (!sel || !sel.rangeCount) return;
+    if (!linkPopover) buildLinkPopover();
+    savedRange = sel.getRangeAt(0).cloneRange();
+    var anchor = closestTag(sel.anchorNode, "a") || closestTag(sel.focusNode, "a");
+    linkPopover.__anchor = anchor || null;
+    linkPopover.__input.value = anchor ? (anchor.getAttribute("href") || "") : "";
+    linkPopover.__input.classList.remove("webdoc-invalid");
+    linkPopover.__remove.style.display = anchor ? "" : "none";
+    linkPopover.hidden = false;
+    var r = pageRect(state.active);
+    var top = r.top - linkPopover.offsetHeight - 8;
+    if (top < window.scrollY + 4) top = r.bottom + 8;
+    linkPopover.style.top = top + "px";
+    linkPopover.style.left = r.left + "px";
+    linkPopover.__input.focus();
+    linkPopover.__input.select();
+  }
+
+  function closeLinkPopover() {
+    if (linkPopover) linkPopover.hidden = true;
+    savedRange = null;
+    if (state.active) state.active.focus();
+  }
+
+  function restoreSaved() {
+    if (!savedRange) return null;
+    var sel = window.getSelection();
+    sel.removeAllRanges();
+    sel.addRange(savedRange);
+    return sel;
+  }
+
+  function applyLink(url) {
+    url = (url || "").trim();
+    var anchor = linkPopover && linkPopover.__anchor;
+    if (!url) { // empty input: remove the link if editing one, else just close
+      if (anchor) removeLink(); else closeLinkPopover();
+      return;
+    }
+    if (isUnsafeScheme(url)) {
+      linkPopover.__input.classList.add("webdoc-invalid");
+      linkPopover.__input.focus();
+      return;
+    }
+    if (anchor) {
+      anchor.setAttribute("href", url);
+      closeLinkPopover();
+      return;
+    }
+    restoreSaved();
+    wrapLink(url);
+    closeLinkPopover();
+  }
+
+  function removeLink() {
+    var anchor = linkPopover && linkPopover.__anchor;
+    if (anchor) {
+      unwrap(anchor);
+    } else {
+      restoreSaved();
+      document.execCommand("unlink");
+    }
+    closeLinkPopover();
   }
 
   function wrapLink(url) {
@@ -470,6 +645,8 @@
     document.body.classList.remove("webdoc-edit-on");
     if (banner) banner.style.display = "none";
     hideToolbar();
+    if (linkPopover) linkPopover.hidden = true;
+    savedRange = null;
     if (toggleBtn) toggleBtn.style.display = "";
   }
 
@@ -480,6 +657,11 @@
     if (toolbar && toolbar.contains(ev.target)) return;
     if (banner && banner.contains(ev.target)) return;
     if (toggleBtn && toggleBtn.contains(ev.target)) return;
+    // A click inside the open link popover must not commit/blur the block.
+    if (linkPopover && !linkPopover.hidden && linkPopover.contains(ev.target)) return;
+    // A click anywhere else dismisses an open popover (without re-focusing,
+    // since we may be activating a different block on the same click).
+    if (linkPopover && !linkPopover.hidden) { linkPopover.hidden = true; savedRange = null; }
 
     var block = ev.target.closest ? ev.target.closest(EDITABLE) : null;
     if (block && block.hasAttribute("data-noedit")) block = null;
@@ -492,6 +674,10 @@
   }
 
   function onKeyDown(ev) {
+    // Keys typed in the link popover are its own concern. This handler runs in
+    // the capture phase (before the input's handler), so without this guard an
+    // Esc/Enter in the popover would also cancel/commit the underlying block.
+    if (linkPopover && !linkPopover.hidden && linkPopover.contains(ev.target)) return;
     if (!state.on || !state.active) return;
     var mod = ev.metaKey || ev.ctrlKey;
     if (ev.key === "Escape") {

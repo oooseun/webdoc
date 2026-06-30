@@ -8,6 +8,7 @@ on a whitelist so nothing else survives:
     text                 -> escaped plain text
     <strong>/<b>         -> **x**
     <em>/<i>             -> *x*
+    <s>/<del>/<strike>   -> ~~x~~
     <code>               -> `x`   (content kept literal; fence widens if it
                                    contains backticks, CommonMark-style)
     <a href="u">t</a>    -> [t](u)   (dropped to plain text if u is a
@@ -31,7 +32,12 @@ import re
 from html.parser import HTMLParser
 
 # Inline marks we emit, by delimiter. Nested identical marks collapse to one.
-_MARK_TAGS = {"strong": "**", "b": "**", "em": "*", "i": "*"}
+# strikeThrough via execCommand emits <strike>/<s>; a re-rendered block uses
+# <del> (inline_md output) - all three map to ~~.
+_MARK_TAGS = {
+    "strong": "**", "b": "**", "em": "*", "i": "*",
+    "del": "~~", "s": "~~", "strike": "~~",
+}
 
 # Block-level elements: emit a word boundary on enter/leave so an editor's
 # Enter-inserted <div>/<p> (or a stray <tr>/<li>) does not concatenate the
@@ -58,7 +64,11 @@ _CTRL_RUN = re.compile(r"[\x00-\x20]+")
 
 
 def _escape_text(text: str) -> str:
-    return "".join(_ESCAPE.get(ch, ch) for ch in text)
+    out = "".join(_ESCAPE.get(ch, ch) for ch in text)
+    # A literal "~~" typed as text must not re-parse as strikethrough on the next
+    # render. Escape doubled tildes (inline_md unescapes \~); a lone ~ (home
+    # paths, "~5") is left untouched. Mirrors how *, `, [, ] are escaped above.
+    return out.replace("~~", "\\~\\~")
 
 
 def _escape_href(href: str) -> str:
@@ -111,7 +121,7 @@ class _Converter(HTMLParser):
         # size its backtick fence to the content (CommonMark).
         self.code_buf: list[str] = []
         # How many delimiters of each kind are currently open (for collapsing).
-        self.mark_depth: dict[str, int] = {"**": 0, "*": 0}
+        self.mark_depth: dict[str, int] = {"**": 0, "*": 0, "~~": 0}
 
     # -- word boundaries -----------------------------------------------------
     def _boundary(self) -> None:
@@ -215,8 +225,10 @@ class _Converter(HTMLParser):
     # -- text ----------------------------------------------------------------
     def handle_data(self, data: str) -> None:
         # Non-breaking spaces (&nbsp; / U+00A0) are an editing artifact; treat
-        # them as ordinary spaces so words stay separable, not glued.
-        data = data.replace("\xa0", " ")
+        # them as ordinary spaces so words stay separable, not glued. Strip NUL:
+        # it is create_site.inline_md's placeholder sentinel, so it must never
+        # reach the .md (a crafted payload could otherwise desync the renderer).
+        data = data.replace("\xa0", " ").replace("\x00", "")
         if self.code_depth > 0:
             self.code_buf.append(data)  # literal inside a code span
         else:

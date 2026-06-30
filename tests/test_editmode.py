@@ -71,6 +71,57 @@ def _():
     eq(html_to_markdown("<i>a</i>"), "*a*", "i")
 
 
+@test("html2md: s/del/strike -> ~~ (strikethrough), nests + collapses")
+def _():
+    eq(html_to_markdown("<s>a</s>"), "~~a~~", "s")
+    eq(html_to_markdown("<del>a</del>"), "~~a~~", "del (re-rendered form)")
+    eq(html_to_markdown("<strike>a</strike>"), "~~a~~", "strike")
+    eq(html_to_markdown("a <s>b</s> c"), "a ~~b~~ c", "inline")
+    eq(html_to_markdown("<strong>x <s>y</s></strong>"), "**x ~~y~~**", "nested in bold")
+    eq(html_to_markdown("<s><del>x</del></s>"), "~~x~~", "identical marks collapse")
+
+
+@test("strikethrough: inline_md renders <del>, full md<->html cycle is stable")
+def _():
+    eq(create_site.inline_md("~~x~~"), "<del>x</del>", "render")
+    eq(create_site.inline_md("a ~~b~~ c"), "a <del>b</del> c", "inline render")
+    for md in ["~~struck~~", "**bold ~~x~~**", "before ~~mid~~ after", "~~a~~ ~~b~~"]:
+        eq(html_to_markdown(create_site.inline_md(md)), md, "round-trip stable: " + md)
+    # A literal "~~" typed as text is escaped on save and renders literally,
+    # never re-parsing as strikethrough.
+    typed = html_to_markdown("~~not struck~~")
+    eq(typed, "\\~\\~not struck\\~\\~", "literal ~~ escaped on save")
+    eq(create_site.inline_md(typed), "~~not struck~~", "and renders literally, not struck")
+
+
+@test("inline_md: marks render inside link text; no NUL leak; strike-in-link stable")
+def _():
+    inl = create_site.inline_md
+    # P2: emphasis/strike/code inside a link label render (not shown literally)
+    eq("<strong>b</strong>" in inl("[**b**](http://x)"), True, "bold in link text")
+    eq("<del>s</del>" in inl("[~~s~~](http://x)"), True, "strike in link text")
+    eq("<code>c</code>" in inl("[`c`](http://x)"), True, "code in link text")
+    # P1: a Markdown-special char in link text must not leak a NUL placeholder
+    for md in ["[a\\*b](http://x)", "[u \\`q\\`](http://x)", "[a\\~\\~b](http://x)"]:
+        eq("\x00" in inl(md), False, "NUL leaked for " + md)
+    # strike inside a link round-trips stably over two save/render cycles
+    md1 = html_to_markdown('<a href="http://x"><s>t</s></a>')
+    eq(md1, "[~~t~~](http://x)", "strike-in-link save1")
+    md2 = html_to_markdown(create_site.inline_md(md1))
+    eq(md2, md1, "strike-in-link stable on re-save")
+    eq("\x00" in create_site.inline_md(md2), False, "no NUL on re-render")
+
+
+@test("NUL sentinel: html2md strips it; inline_md drops a stray marker, no crash")
+def _():
+    # html2md must never emit the placeholder sentinel into the .md.
+    eq(html_to_markdown("a\x00b"), "ab", "NUL stripped from text")
+    eq(html_to_markdown("<code>a\x00b</code>"), "`ab`", "NUL stripped inside code")
+    # A crafted/stray \x00N\x00 marker in source must not raise or leak a NUL.
+    eq(create_site.inline_md("\x0099\x00"), "", "out-of-range marker dropped")
+    eq("\x00" in create_site.inline_md("ok \x007\x00 done"), False, "no NUL leak")
+
+
 @test("html2md: code is literal (no escaping, no nested marks)")
 def _():
     eq(html_to_markdown("<code>x</code>"), "`x`")

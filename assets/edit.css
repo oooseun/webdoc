@@ -195,6 +195,15 @@ body.webdoc-edit-on .webdoc-conflict {
   box-shadow: 0 6px 22px rgba(0, 0, 0, 0.18);
 }
 
+/* The toolbar and the link popover toggle visibility via the `hidden` attribute,
+   but their `display: flex` overrides the UA `[hidden] { display: none }` rule.
+   Restore it explicitly (class+attribute outranks the class-only rule above), or
+   they linger in the read view and the popover intercepts toolbar clicks. */
+.webdoc-toolbar[hidden],
+.webdoc-link-pop[hidden] {
+  display: none;
+}
+
 .webdoc-toolbar button {
   min-width: 30px;
   padding: 5px 9px;
@@ -220,6 +229,68 @@ body.webdoc-edit-on .webdoc-conflict {
 
 .webdoc-toolbar button[data-cmd="code"] {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+.webdoc-toolbar button[data-cmd="strike"] {
+  text-decoration: line-through;
+}
+
+.webdoc-toolbar button[data-cmd="clear"],
+.webdoc-toolbar button[data-cmd="link"] {
+  font-size: 0.78rem;
+}
+
+/* Inline link editor (add / edit / remove), shown by the Link button. */
+.webdoc-link-pop {
+  position: absolute;
+  z-index: 1002;
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  padding: 7px 8px;
+  border: 1px solid #d9dfdc;
+  border-radius: 7px;
+  background: #fff;
+  box-shadow: 0 6px 22px rgba(0, 0, 0, 0.18);
+}
+
+.webdoc-link-pop input.webdoc-link-input {
+  width: 240px;
+  padding: 5px 8px;
+  border: 1px solid #c9d2cf;
+  border-radius: 5px;
+  font: 0.85rem/1.3 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  color: #1f2528;
+}
+
+.webdoc-link-pop input.webdoc-invalid {
+  border-color: #b91c1c;
+  background: #fdecec;
+}
+
+.webdoc-link-pop button {
+  padding: 5px 10px;
+  border: 1px solid #d9dfdc;
+  border-radius: 5px;
+  background: #f3f6f4;
+  color: #1f2528;
+  font: 600 0.82rem/1 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  cursor: pointer;
+}
+
+.webdoc-link-pop button.webdoc-link-apply {
+  border-color: #0f766e;
+  background: #0f766e;
+  color: #fff;
+}
+
+.webdoc-link-pop button.webdoc-link-remove {
+  border-color: #d8b4b4;
+  color: #b91c1c;
+}
+
+.webdoc-link-pop button:hover {
+  filter: brightness(0.96);
 }
 
 /* Per-block save status pill (saving / saved / error). */
@@ -286,6 +357,7 @@ body:not(.webdoc-edit-on) .webdoc-lint {
   .webdoc-edit-banner,
   .webdoc-edit-notice,
   .webdoc-toolbar,
+  .webdoc-link-pop,
   .webdoc-status,
   .webdoc-lint {
     display: none !important;

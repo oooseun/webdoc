@@ -177,6 +177,15 @@ def inline_md(text: str) -> str:
         placeholders.append(htmlfrag)
         return f"\x00{len(placeholders) - 1}\x00"
 
+    def emph(s: str) -> str:
+        # Bold / italic / strikethrough. Applied to the whole line and, separately,
+        # to a link's label so marks inside link text render. Any already-stashed
+        # code span / escaped char in `s` is an inert \x00N\x00 marker here.
+        s = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", s)
+        s = re.sub(r"(?<!\*)\*([^*]+)\*(?!\*)", r"<em>\1</em>", s)
+        s = re.sub(r"~~([^~\n]+)~~", r"<del>\1</del>", s)
+        return s
+
     # Code spans: an opening backtick run not escaped by a preceding backslash,
     # closed by a run of the same length. Widening the fence lets backtick-
     # bearing content round-trip; the (?<!\\) guard means a typed-then-escaped
@@ -191,17 +200,18 @@ def inline_md(text: str) -> str:
     # AFTER code spans are stashed (so a backslash inside `code` stays literal)
     # and BEFORE the link/image/emphasis rules, so the edit round-trip can write
     # a literal `*`/`` ` ``/`[`/`]`/`\` as \X and have it render as the bare char.
-    escaped = re.sub(r"\\([\\`*\[\]])", lambda m: stash(m.group(1)), escaped)
+    escaped = re.sub(r"\\([\\`*\[\]~])", lambda m: stash(m.group(1)), escaped)
     # ![alt](src) images — must run before the link rule (it contains [alt](src))
     escaped = re.sub(
         r"!\[([^\]]*)\]\(([^)]+)\)",
         lambda m: stash(_image(m.group(2), m.group(1))),
         escaped,
     )
-    # [label](url)
+    # [label](url) — the label is emphasis-processed so bold/italic/strike inside
+    # link text render (code spans + escaped chars in it are already stashed).
     escaped = re.sub(
         r"\[([^\]]+)\]\(([^)]+)\)",
-        lambda m: stash(_anchor(m.group(2), m.group(1))),
+        lambda m: stash(_anchor(m.group(2), emph(m.group(1)))),
         escaped,
     )
     # <url> autolinks (angle brackets were escaped to &lt;...&gt;)
@@ -216,11 +226,23 @@ def inline_md(text: str) -> str:
         lambda m: stash(_anchor(m.group(1), m.group(1))),
         escaped,
     )
-    escaped = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", escaped)
-    escaped = re.sub(r"(?<!\*)\*([^*]+)\*(?!\*)", r"<em>\1</em>", escaped)
+    escaped = emph(escaped)
 
-    # Restore placeholders
-    escaped = re.sub(r"\x00(\d+)\x00", lambda m: placeholders[int(m.group(1))], escaped)
+    # Restore placeholders, repeatedly. A stashed anchor's label can itself hold
+    # placeholders (escaped chars / code spans), so a single pass would leave the
+    # inner \x00N\x00 markers (NUL bytes) in the output. Loop until stable. An
+    # out-of-range index (only reachable via a crafted NUL in the source, which
+    # html2md now strips) is dropped rather than raising or leaking the NUL.
+    n = len(placeholders)
+    while "\x00" in escaped:
+        expanded = re.sub(
+            r"\x00(\d+)\x00",
+            lambda m: placeholders[int(m.group(1))] if int(m.group(1)) < n else "",
+            escaped,
+        )
+        if expanded == escaped:
+            break  # a stray \x00 that is not a valid marker; stop rather than spin
+        escaped = expanded
     return leading_literal + escaped
 
 
