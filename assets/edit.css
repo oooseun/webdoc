@@ -312,6 +312,14 @@ body.webdoc-edit-on .webdoc-conflict {
   filter: brightness(0.96);
 }
 
+/* Authored vertical spacing (an extra blank line). Invisible in the read view;
+   in edit mode a faint dashed box shows it is an editable gap (Backspace at the
+   start of the block below removes it; Enter there adds one). */
+body.webdoc-edit-on .webdoc-gap {
+  outline: 1px dashed rgba(15, 118, 110, 0.3);
+  border-radius: 3px;
+}
+
 /* Per-block save status pill (saving / saved / error). */
 .webdoc-status {
   position: absolute;

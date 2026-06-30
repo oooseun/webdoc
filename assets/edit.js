@@ -388,6 +388,74 @@
     });
   }
 
+  // -- vertical spacing (Enter / Backspace at a block's start) --------------
+
+  // True when the caret is collapsed at the very start of the block (no text
+  // before it), so Enter means "add a gap above" rather than a line break.
+  function caretAtStart(block) {
+    var sel = window.getSelection();
+    if (!sel || !sel.isCollapsed || !sel.rangeCount) return false;
+    var r = sel.getRangeAt(0);
+    if (!block.contains(r.startContainer)) return false;
+    var probe = document.createRange();
+    probe.selectNodeContents(block);
+    probe.setEnd(r.startContainer, r.startOffset);
+    return probe.toString().length === 0;
+  }
+
+  // A gap element identical to what create_site emits for an extra blank line,
+  // so a live-added gap and a rebuilt one look the same.
+  function makeGap() {
+    var g = el("div", "webdoc-gap");
+    g.setAttribute("data-noedit", "");
+    g.setAttribute("aria-hidden", "true");
+    g.style.height = "0.7em";
+    return g;
+  }
+
+  // Add or remove one blank line before the block (a visible gap), persisted to
+  // source. The block's content is untouched. Undoable. `dir` is "add"|"remove".
+  function changeSpace(block, dir) {
+    var existingGap = dir === "remove" ? block.previousElementSibling : null;
+    pendingSaves++;
+    fetch("/api/edit", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        op: "space", type: block.dataset.mdType,
+        start: parseInt(block.dataset.mdStart, 10),
+        end: parseInt(block.dataset.mdEnd, 10),
+        hash: block.dataset.mdHash, dir: dir
+      })
+    }).then(function (resp) {
+      return resp.json().catch(function () { return {}; }).then(function (body) {
+        return { status: resp.status, ok: resp.ok, body: body };
+      });
+    }).then(function (res) {
+      if (res.status === 409) { onConflict(block, res.body); return; }
+      if (!res.ok || !res.body || !res.body.ok) {
+        if (res.status === 403 && res.body && res.body.error === "loopback_only") showLanNotice();
+        else if (!(res.body && res.body.error === "no_space")) setStatus(block, "error", friendlyError(res.body));
+        return;
+      }
+      var gapNode;
+      if (dir === "add") {
+        gapNode = makeGap();
+        if (block.parentNode) block.parentNode.insertBefore(gapNode, block);
+      } else {
+        gapNode = existingGap;
+        if (gapNode && gapNode.parentNode) gapNode.parentNode.removeChild(gapNode);
+      }
+      shiftFollowing(res.body.shift_threshold, res.body.line_delta || 0, null);
+      pushUndo({ label: "space", dir: dir, block: block, gap: gapNode });
+      setStatus(block, "saved", dir === "add" ? "space added" : "space removed");
+    }).catch(function () {
+      setStatus(block, "error", "couldn't change spacing (offline?)");
+    }).finally(function () {
+      pendingSaves--;
+    });
+  }
+
   // -- link popover (add / edit / remove) ----------------------------------
 
   // Mirror the server + html2md scheme policy: drop control/space chars, then
@@ -803,6 +871,7 @@
   function undoEntryMatches(entry, body) {
     if (body.label !== entry.label) return false;
     if (entry.label === "cell") return body.line === entry.line && body.cell === entry.cell;
+    if (entry.label === "space") return true; // splice-level; no block identity to compare
     return body.new_start === entry.expectStart; // edit + delete
   }
 
@@ -811,6 +880,19 @@
       undoStack.length = 0;
       updateUndoBtn();
       flash("Undo got out of sync. Reload to be safe.");
+      return;
+    }
+    if (entry.label === "space") {
+      // Reverse the gap: an added gap is removed, a removed one re-inserted; then
+      // re-shift the block (and everything after) by the splice delta.
+      if (entry.dir === "add") {
+        if (entry.gap && entry.gap.parentNode) entry.gap.parentNode.removeChild(entry.gap);
+      } else if (entry.block && entry.block.parentNode) {
+        entry.block.parentNode.insertBefore(entry.gap, entry.block);
+      }
+      shiftFollowing(body.shift_threshold, body.line_delta || 0, null);
+      setStatus(entry.block, "saved", "undone");
+      updateCount();
       return;
     }
     var node = entry.node;
@@ -906,6 +988,25 @@
       return;
     }
     if (!state.active) return;
+    // Spacing: at a paragraph/heading's very start, Enter adds a gap above it,
+    // and Backspace removes one (when a gap is there) instead of doing nothing
+    // across the contenteditable boundary. List items are excluded - a blank line
+    // would split the list. Anywhere else, Enter/Backspace behave normally.
+    var spaceable = state.active.dataset.mdType === "paragraph" ||
+                    state.active.dataset.mdType === "heading";
+    if (spaceable && ev.key === "Enter" && !mod && caretAtStart(state.active)) {
+      ev.preventDefault();
+      changeSpace(state.active, "add");
+      return;
+    }
+    if (spaceable && ev.key === "Backspace" && !mod && caretAtStart(state.active)) {
+      var prev = state.active.previousElementSibling;
+      if (prev && prev.classList && prev.classList.contains("webdoc-gap")) {
+        ev.preventDefault();
+        changeSpace(state.active, "remove");
+        return;
+      }
+    }
     if (ev.key === "Escape") {
       ev.preventDefault();
       cancelActive();

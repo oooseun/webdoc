@@ -387,14 +387,29 @@ def parse_markdown(markdown: str, mode: str = "site") -> tuple[str, list[dict[st
     editable = mode == "site"
     noedit = " data-noedit" if editable else ""
     i = 0
+    pending_blanks = 0  # consecutive blank source lines seen before the next block
 
     while i < len(lines):
         line = lines[i]
         stripped = line.strip()
 
         if not stripped:
+            pending_blanks += 1
             i += 1
             continue
+
+        # Blank lines beyond the block separator render as visible vertical gaps:
+        # this is how extra spacing is authored (the editor's Enter-at-block-start
+        # writes one). One blank is the normal separator between two blocks; the
+        # first block has no separator, so every leading blank counts as a gap.
+        # Site mode only - the doc export stays clean. Capped so a pathological run
+        # of blanks can't blow out the page.
+        if editable and pending_blanks:
+            extra = pending_blanks - (1 if out else 0)
+            if extra > 0:
+                gap = '<div class="webdoc-gap" data-noedit aria-hidden="true" style="height:0.7em"></div>'
+                out.append(gap * min(extra, 12))
+        pending_blanks = 0
 
         block_start = i  # 0-based source line where this block begins
 

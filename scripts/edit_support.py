@@ -38,6 +38,10 @@ except Exception:  # pragma: no cover - linter is advisory; absence must not bre
 
 RANGE_TYPES = {"paragraph", "heading", "listitem"}
 ALL_TYPES = RANGE_TYPES | {"tablecell"}
+# Spacing is paragraph/heading only: list items have no blank line between them,
+# so inserting one would split the list (and renumber an ordered one) instead of
+# adding a gap. Delete still works on list items (it removes the whole line).
+_SPACE_TYPES = {"paragraph", "heading"}
 _STALE = {"error": "stale_block", "message": "this block changed on disk — reload"}
 
 _HEADING_PREFIX = re.compile(r"^(\s*#{1,6}\s+)")
@@ -273,9 +277,12 @@ def apply_edit(source_path: str | Path, payload: dict) -> tuple[int, dict]:
     op = str(payload.get("op", "edit"))
     btype = str(payload.get("type", ""))
     if op == "delete":
-        # Delete is range-only: a single table cell cannot be removed without
-        # breaking the row (row/column delete is a separate feature).
+        # Delete is range-only: a table cell cannot be removed (breaks the row).
         if btype not in RANGE_TYPES:
+            return 400, {"error": "bad_type"}
+    elif op == "space":
+        # Spacing is paragraph/heading only (a blank would split a list).
+        if btype not in _SPACE_TYPES:
             return 400, {"error": "bad_type"}
     elif btype not in ALL_TYPES:
         return 400, {"error": "bad_type"}
@@ -294,6 +301,8 @@ def apply_edit(source_path: str | Path, payload: dict) -> tuple[int, dict]:
 
     if op == "delete":
         return _apply_delete(source_path, lines, trailing_newline, payload, btype, newline)
+    if op == "space":
+        return _apply_space(source_path, lines, trailing_newline, payload, btype, newline)
 
     flat = flatten(html_to_markdown(str(payload.get("html", ""))))
 
@@ -506,6 +515,76 @@ def _apply_delete(
         "end": end,
         "line_delta": -(end - start + 1),
     }
+
+
+def _apply_space(
+    source_path: Path,
+    lines: list[str],
+    trailing_newline: bool,
+    payload: dict,
+    btype: str,
+    newline: str = "\n",
+) -> tuple[int, dict]:
+    """Add or remove one blank line immediately before a block, for vertical spacing.
+
+    The block's content is untouched - only the gap above it changes (extra blank
+    lines render as gaps; see create_site). Hash-checked on the block so we space
+    the right one and catch drift. Undoable. `shift_threshold` is start-1 so the
+    spaced block itself (and everything after) re-shifts by line_delta on the
+    client, which also manages the gap element."""
+    try:
+        start = int(payload["start"])
+        end = int(payload["end"])
+    except (KeyError, TypeError, ValueError):
+        return 400, {"error": "bad_range"}
+    if start < 1 or end < start or end > len(lines):
+        return 409, dict(_STALE)
+    original_slice = lines[start - 1:end]
+    digest = block_hash("\n".join(original_slice))
+    if digest != str(payload.get("hash", "")):
+        return 409, dict(_STALE)
+
+    direction = str(payload.get("dir", "add"))
+
+    if direction == "add":
+        new_lines = lines[:start - 1] + [""] + lines[start - 1:]
+        _write_lines(source_path, new_lines, trailing_newline, newline)
+        _push_undo(source_path, {
+            "label": "space", "at": start - 1, "remove": 1, "insert": [],
+            "expect": [""], "trailing": trailing_newline, "newline": newline,
+        })
+        return 200, {
+            "ok": True, "op": "space", "type": btype, "dir": "add",
+            "new_start": start + 1, "new_end": end + 1, "new_hash": digest,
+            "line_delta": 1, "shift_threshold": start - 1,
+        }
+
+    if direction == "remove":
+        # Count the consecutive blank lines immediately before the block. Keep one
+        # as the block separator (none required if only blanks precede the block,
+        # i.e. it is the first block); refuse if there is no extra gap to remove.
+        gap = 0
+        j = start - 2
+        while j >= 0 and lines[j].strip() == "":
+            gap += 1
+            j -= 1
+        is_first = (start - 1 - gap) <= 0
+        if gap - (0 if is_first else 1) < 1:
+            return 400, {"error": "no_space", "message": "no extra spacing to remove"}
+        new_lines = lines[:start - 2] + lines[start - 1:]
+        _write_lines(source_path, new_lines, trailing_newline, newline)
+        _push_undo(source_path, {
+            "label": "space", "at": start - 2, "remove": 0, "insert": [""],
+            "expect": [], "anchor": original_slice[0] if original_slice else None,
+            "trailing": trailing_newline, "newline": newline,
+        })
+        return 200, {
+            "ok": True, "op": "space", "type": btype, "dir": "remove",
+            "new_start": start - 1, "new_end": end - 1, "new_hash": digest,
+            "line_delta": -1, "shift_threshold": start - 1,
+        }
+
+    return 400, {"error": "bad_dir"}
 
 
 def apply_undo(source_path: str | Path) -> tuple[int, dict]:

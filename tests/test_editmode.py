@@ -820,6 +820,94 @@ def _():
     assert b"\r\n" in raw and b"\nFirst" not in raw, f"CRLF preserved through undo: {raw!r}"
 
 
+# --------------------------------------------------------------------------- #
+# Spacing (op="space") + undo
+# --------------------------------------------------------------------------- #
+
+@test("space: add inserts a blank before the block and shifts it down")
+def _():
+    text = "Title line.\n\nBody paragraph.\n"
+    src = write_md(text)
+    status, body = edit_support.apply_edit(src, {
+        "op": "space", "type": "paragraph", "start": 3, "end": 3,
+        "hash": slice_hash(text, 3, 3), "dir": "add"})
+    eq(status, 200, "status")
+    eq(body["dir"], "add", "dir")
+    eq(body["new_start"], 4, "block shifted down a line")
+    eq(body["line_delta"], 1, "one blank added")
+    eq(src.read_text(encoding="utf-8"), "Title line.\n\n\nBody paragraph.\n", "extra blank before the block")
+
+
+@test("space: add then undo restores exact bytes")
+def _():
+    text = "Title line.\n\nBody paragraph.\n"
+    src = write_md(text)
+    edit_support.apply_edit(src, {
+        "op": "space", "type": "paragraph", "start": 3, "end": 3,
+        "hash": slice_hash(text, 3, 3), "dir": "add"})
+    status, body = edit_support.apply_undo(src)
+    eq(status, 200, "undo status")
+    eq(body["label"], "space", "label")
+    eq(src.read_text(encoding="utf-8"), text, "restored to exact bytes")
+
+
+@test("space: remove deletes one extra blank, refuses to remove the separator")
+def _():
+    text = "Title line.\n\n\nBody paragraph.\n"  # two blanks before the block
+    src = write_md(text)
+    status, _ = edit_support.apply_edit(src, {
+        "op": "space", "type": "paragraph", "start": 4, "end": 4,
+        "hash": slice_hash(text, 4, 4), "dir": "remove"})
+    eq(status, 200, "remove status")
+    eq(src.read_text(encoding="utf-8"), "Title line.\n\nBody paragraph.\n", "one extra blank removed")
+    t2 = src.read_text(encoding="utf-8")  # only the separator remains
+    status2, body2 = edit_support.apply_edit(src, {
+        "op": "space", "type": "paragraph", "start": 3, "end": 3,
+        "hash": slice_hash(t2, 3, 3), "dir": "remove"})
+    eq(status2, 400, "refuses to remove the separator")
+    eq(body2["error"], "no_space", "error")
+    eq(src.read_text(encoding="utf-8"), t2, "unchanged when refused")
+
+
+@test("space: a list item cannot be spaced (bad_type), file unchanged")
+def _():
+    text = "- one\n- two\n"
+    src = write_md(text)
+    status, body = edit_support.apply_edit(src, {
+        "op": "space", "type": "listitem", "start": 2, "end": 2,
+        "hash": slice_hash(text, 2, 2), "dir": "add"})
+    eq(status, 400, "status")
+    eq(body["error"], "bad_type", "error")
+    eq(src.read_text(encoding="utf-8"), text, "unchanged")
+
+
+@test("create_site: extra blanks render as gaps; the first block's leading blanks count")
+def _():
+    # one separator blank -> no gap; a second -> one gap.
+    md = "First.\n\nSecond.\n\n\nThird.\n"
+    site_html, _, _ = create_site.parse_markdown(md, mode="site")
+    eq(site_html.count("webdoc-gap"), 1, "one gap for the double blank, none for the single separator")
+    # before the first block there is no separator, so every leading blank is a gap.
+    lead_html, _, _ = create_site.parse_markdown("\n\n# Title\n\nbody\n", mode="site")
+    eq(lead_html.count("webdoc-gap"), 2, "two leading blanks -> two gaps (no separator to discount)")
+    # the doc export stays clean.
+    doc_html, _, _ = create_site.parse_markdown(md, mode="doc")
+    assert "webdoc-gap" not in doc_html, "no gaps leak into the doc export"
+
+
+@test("space: remove then undo restores the extra blank")
+def _():
+    text = "Title line.\n\n\nBody paragraph.\n"
+    src = write_md(text)
+    edit_support.apply_edit(src, {
+        "op": "space", "type": "paragraph", "start": 4, "end": 4,
+        "hash": slice_hash(text, 4, 4), "dir": "remove"})
+    eq(src.read_text(encoding="utf-8"), "Title line.\n\nBody paragraph.\n", "removed")
+    status, _ = edit_support.apply_undo(src)
+    eq(status, 200, "undo status")
+    eq(src.read_text(encoding="utf-8"), text, "extra blank restored")
+
+
 def main() -> int:
     print(f"editmode test suite  ({len(TESTS)} tests)")
     print(f"  modules: {SCRIPTS}")
