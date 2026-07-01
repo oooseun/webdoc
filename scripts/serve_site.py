@@ -30,6 +30,11 @@ try:
 except Exception:  # pragma: no cover - editing mode is optional; absence must not break serving
     edit_support = None  # type: ignore[assignment]
 
+try:
+    import create_site
+except Exception:  # pragma: no cover - rebuild-after-edit is best-effort; absence must not break serving
+    create_site = None  # type: ignore[assignment]
+
 
 DEFAULT_ROOT = Path(os.environ.get("AGENT_ARTIFACT_SITES", "~/agent-artifacts/sites")).expanduser()
 LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
@@ -278,6 +283,14 @@ class NoListingHandler(http.server.SimpleHTTPRequestHandler):
         try:
             with EDIT_LOCK:
                 status, body = edit_support.apply_edit(source, payload)
+                # Regenerate the served page from the updated source so the edit
+                # survives a reload (best-effort; a rebuild failure never fails the
+                # edit, which already persisted). Inside the lock so index.html and
+                # the source stay consistent. Log a failure so a stale served page
+                # after an edit isn't silent.
+                if status == 200 and create_site is not None:
+                    if not create_site.rebuild_html(source, self.site_dir()):
+                        self.log_message("rebuild after edit failed; served page may be stale until next rebuild")
         except Exception as exc:  # never leak a stack trace to the client
             self.log_message("edit error: %r", exc)
             self.send_json(500, {"error": "edit_failed"})
@@ -300,6 +313,9 @@ class NoListingHandler(http.server.SimpleHTTPRequestHandler):
         try:
             with EDIT_LOCK:
                 status, body = edit_support.apply_undo(source)
+                if status == 200 and create_site is not None:
+                    if not create_site.rebuild_html(source, self.site_dir()):
+                        self.log_message("rebuild after undo failed; served page may be stale until next rebuild")
         except Exception as exc:  # never leak a stack trace to the client
             self.log_message("undo error: %r", exc)
             self.send_json(500, {"error": "undo_failed"})

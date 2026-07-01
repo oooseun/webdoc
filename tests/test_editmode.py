@@ -908,6 +908,69 @@ def _():
     eq(src.read_text(encoding="utf-8"), text, "extra blank restored")
 
 
+# --------------------------------------------------------------------------- #
+# Reload persistence (create_site.rebuild_html)
+# --------------------------------------------------------------------------- #
+
+@test("rebuild_html: an edit is reflected in index.html and its hash matches source")
+def _():
+    import subprocess
+    import re as _re
+    d = Path(tempfile.mkdtemp(prefix="webdoc-rebuild-"))
+    src = d / "doc.md"
+    src.write_text("# Title\n\nOriginal body.\n", encoding="utf-8")
+    out = d / "site"
+    proc = subprocess.run(
+        [sys.executable, str(SCRIPTS / "create_site.py"), str(src), "--out", str(out), "--no-lint"],
+        capture_output=True, text=True)
+    eq(proc.returncode, 0, f"build ok (stderr: {proc.stderr})")
+    assert "Original body." in (out / "index.html").read_text(encoding="utf-8"), "original renders"
+
+    # Edit the paragraph through the server round-trip (writes the source only).
+    t = src.read_text(encoding="utf-8")
+    status, _ = edit_support.apply_edit(
+        src, {"type": "paragraph", "start": 3, "end": 3, "hash": slice_hash(t, 3, 3), "html": "Edited body."})
+    eq(status, 200, "edit ok")
+    assert "Original body." in (out / "index.html").read_text(encoding="utf-8"), "index.html is stale before rebuild"
+
+    ok = create_site.rebuild_html(src, out)
+    eq(ok, True, "rebuild ok")
+    idx = (out / "index.html").read_text(encoding="utf-8")
+    assert "Edited body." in idx and "Original body." not in idx, "index.html now reflects the edit"
+    # The rebuilt page's block hash matches the current source, so a reloaded page
+    # will not 409 on the next edit.
+    m = _re.search(r'<p data-md-start="3" data-md-end="3" data-md-hash="([0-9a-f]+)"', idx)
+    assert m, f"paragraph attrs present in rebuilt index.html:\n{idx[:400]}"
+    eq(m.group(1), slice_hash(src.read_text(encoding="utf-8"), 3, 3), "rebuilt hash matches the source")
+
+
+@test("rebuild_html: preserves title, gaps, and custom css/js from the manifest")
+def _():
+    import subprocess
+    import json as _json
+    d = Path(tempfile.mkdtemp(prefix="webdoc-rebuild2-"))
+    src = d / "doc.md"
+    # a double blank -> one gap; a custom css bundled
+    src.write_text("# Kept Title\n\nA.\n\n\nB.\n", encoding="utf-8")
+    css = d / "extra.css"
+    css.write_text("/* x */\n", encoding="utf-8")
+    out = d / "site"
+    proc = subprocess.run(
+        [sys.executable, str(SCRIPTS / "create_site.py"), str(src), "--out", str(out),
+         "--title", "Kept Title", "--css", str(css), "--no-lint"],
+        capture_output=True, text=True)
+    eq(proc.returncode, 0, f"build ok (stderr: {proc.stderr})")
+    manifest = _json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    eq(manifest.get("custom_css"), ["extra.css"], "custom css recorded in manifest")
+
+    ok = create_site.rebuild_html(src, out)
+    eq(ok, True, "rebuild ok")
+    idx = (out / "index.html").read_text(encoding="utf-8")
+    assert "<title>Kept Title</title>" in idx, "title preserved"
+    assert 'href="./extra.css"' in idx, "custom css link preserved on rebuild"
+    eq(idx.count("webdoc-gap"), 1, "the authored gap still renders after rebuild")
+
+
 def main() -> int:
     print(f"editmode test suite  ({len(TESTS)} tests)")
     print(f"  modules: {SCRIPTS}")

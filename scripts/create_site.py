@@ -22,6 +22,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -776,6 +777,84 @@ def write_registry(out_dir: Path, manifest: dict[str, object]) -> None:
     registry_path.write_text(json.dumps(registry, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
+def _atomic_write(path: Path, text: str) -> None:
+    """Write text to path atomically (temp file in the same dir + rename), so a
+    concurrent HTTP GET never reads a half-written page during a rebuild."""
+    directory = path.parent
+    fd, tmp = tempfile.mkstemp(dir=str(directory), prefix=".webdoc-rebuild-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def rebuild_html(source_path: str | Path, out_dir: str | Path) -> bool:
+    """Regenerate index.html + doc.html from the current source, reusing the
+    manifest's build settings (title, bundled custom css/js, stepper).
+
+    This is what makes an edit made via /api/edit survive a browser reload: the
+    write path updates the canonical .md, and the server calls this so the served
+    static page is re-rendered from it. No lint gate and no asset re-copy - only
+    the HTML is regenerated (style.css / edit.js / edit.css / stepper.js and any
+    bundled media are already in place and unchanged by an edit). Returns True on
+    success; never raises, because a rebuild failure must not undo the edit that
+    already persisted to the source."""
+    try:
+        out_dir = Path(out_dir)
+        manifest_path = out_dir / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if not isinstance(manifest, dict):
+            return False
+        source = Path(source_path)
+        markdown = source.read_text(encoding="utf-8", errors="replace")
+
+        body_html, toc, state = parse_markdown(markdown, mode="site")
+        doc_body, _, doc_state = parse_markdown(markdown, mode="doc")
+        doc_body = inline_doc_images(doc_body, out_dir, doc_state)
+
+        title = str(manifest.get("title") or read_title(markdown, source.stem))
+        # Coerce to a list before filtering: a hand-corrupted manifest whose
+        # custom_css is a bare string would otherwise iterate its characters and
+        # emit one <link> per character.
+        raw_css = manifest.get("custom_css")
+        raw_js = manifest.get("custom_js")
+        custom_css = [c for c in raw_css if isinstance(c, str)] if isinstance(raw_css, list) else []
+        custom_js = [j for j in raw_js if isinstance(j, str)] if isinstance(raw_js, list) else []
+
+        # Keep the manifest's source fingerprint honest after the edit.
+        manifest["source_sha256"] = source_hash(source)
+        try:
+            manifest["source_mtime"] = datetime.fromtimestamp(
+                source.stat().st_mtime, timezone.utc).isoformat(timespec="seconds")
+        except OSError:
+            pass
+        manifest["generated_at"] = now_iso()
+
+        page = render_html(
+            title, source.resolve(), body_html, toc, manifest,
+            custom_css=custom_css, custom_js=custom_js,
+            include_stepper=bool(state.get("stepper")),
+        )
+        doc_page = render_doc_html(title, doc_body)
+
+        # index.html first: reload-persistence depends on it. Each write is
+        # individually atomic; the set is not transactional, so if a later write
+        # fails the manifest fingerprint may lag - harmless, since edit conflict
+        # checks recompute block hashes from the live source, not the manifest.
+        _atomic_write(out_dir / "index.html", page)
+        _atomic_write(out_dir / "doc.html", doc_page)
+        _atomic_write(manifest_path, json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+        return True
+    except Exception:
+        return False
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Create a static HTML website from a Markdown file.")
     parser.add_argument("source", type=Path, help="Canonical Markdown/report source file")
@@ -867,6 +946,8 @@ def main() -> int:
         "generated_at": generated_at,
         "generator": "webdoc/create_site.py",
         "template": args.template,
+        "custom_css": custom_css,
+        "custom_js": custom_js,
         "doc_export": doc_export,
     }
 
