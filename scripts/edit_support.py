@@ -28,7 +28,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from create_site import (
-    block_hash, cell_marker, inline_md, rewrite_svg_text, split_table_row, svg_text_at,
+    block_hash, cell_marker, inline_md, is_table_separator, rewrite_svg_text,
+    split_table_row, svg_text_at,
 )
 from html2md import html_to_markdown
 
@@ -280,8 +281,8 @@ def apply_edit(source_path: str | Path, payload: dict) -> tuple[int, dict]:
     "delete" removes a whole range block (paragraph/heading/listitem)."""
     op = str(payload.get("op", "edit"))
     btype = str(payload.get("type", ""))
-    if op == "svgtext":
-        pass  # a sub-element edit (an SVG label); no block type - validated below
+    if op in ("svgtext", "rowdelete", "coldelete"):
+        pass  # sub-element ops (SVG label / table row / table column); no block type
     elif op == "delete":
         # Delete is range-only: a table cell cannot be removed (breaks the row).
         if btype not in RANGE_TYPES:
@@ -317,6 +318,10 @@ def apply_edit(source_path: str | Path, payload: dict) -> tuple[int, dict]:
         return _apply_space(source_path, lines, trailing_newline, payload, btype, newline)
     if op == "svgtext":
         return _apply_svgtext(source_path, lines, trailing_newline, payload, newline)
+    if op == "rowdelete":
+        return _apply_rowdelete(source_path, lines, trailing_newline, payload, newline)
+    if op == "coldelete":
+        return _apply_coldelete(source_path, lines, trailing_newline, payload, newline)
 
     flat = flatten(html_to_markdown(str(payload.get("html", ""))))
 
@@ -481,6 +486,102 @@ def _apply_cell(
         "line_delta": 0,
         "lint": lint_block(cell_text),
     }
+
+
+def _apply_rowdelete(
+    source_path: Path,
+    lines: list[str],
+    trailing_newline: bool,
+    payload: dict,
+    newline: str = "\n",
+) -> tuple[int, dict]:
+    """Delete one data row from a table. The client sends the active cell's
+    line+cell+hash as a drift check (it works from the DOM, not the raw row line).
+    The header and separator rows are never deletable."""
+    try:
+        line = int(payload["line"])
+        cell = int(payload["cell"])
+    except (KeyError, TypeError, ValueError):
+        return 400, {"error": "bad_cell"}
+    if line < 1 or line > len(lines) or cell < 0:
+        return 409, dict(_STALE)
+    row = lines[line - 1]
+    if "|" not in row or is_table_separator(row):
+        return 400, {"error": "bad_row", "message": "only a table data row can be deleted"}
+    # A header row is a table's FIRST row (the line above is not a table row)
+    # immediately followed by the `| --- |` separator. The "first row" test avoids
+    # mistaking a data row that happens to sit above an all-dashes divider row for
+    # the header. Deleting a real header would leave a table with no header.
+    prev_is_table = line >= 2 and "|" in lines[line - 2]
+    if not prev_is_table and line < len(lines) and is_table_separator(lines[line]):
+        return 400, {"error": "bad_row", "message": "the header row can't be deleted"}
+    fields = split_table_row(row)
+    current = fields[cell] if cell < len(fields) else ""
+    if block_hash(current) != str(payload.get("hash", "")):
+        return 409, dict(_STALE)
+
+    new_lines = lines[:line - 1] + lines[line:]
+    _write_lines(source_path, new_lines, trailing_newline, newline)
+    _push_undo(source_path, {
+        "label": "rowdelete", "at": line - 1, "remove": 0, "insert": [row],
+        "expect": [], "anchor": lines[line] if line < len(lines) else None,
+        "trailing": trailing_newline, "newline": newline,
+    })
+    return 200, {"ok": True, "op": "rowdelete", "line": line, "line_delta": -1, "shift_threshold": line}
+
+
+def _apply_coldelete(
+    source_path: Path,
+    lines: list[str],
+    trailing_newline: bool,
+    payload: dict,
+    newline: str = "\n",
+) -> tuple[int, dict]:
+    """Delete one column from every row of a table (header, separator, data). The
+    client sends the table's line range [start,end], the column index, and the
+    active cell's line+cell+hash as a drift check. Line count is unchanged."""
+    try:
+        start = int(payload["start"])
+        end = int(payload["end"])
+        col = int(payload["col"])
+        chkline = int(payload["line"])
+        chkcell = int(payload["cell"])
+    except (KeyError, TypeError, ValueError):
+        return 400, {"error": "bad_range"}
+    if start < 1 or end < start or end > len(lines) or col < 0 or chkline < 1 or chkline > len(lines):
+        return 409, dict(_STALE)
+    chk = split_table_row(lines[chkline - 1])
+    chkcur = chk[chkcell] if 0 <= chkcell < len(chk) else ""
+    if block_hash(chkcur) != str(payload.get("hash", "")):
+        return 409, dict(_STALE)
+
+    new_slice: list[str] = []
+    removed = False
+    for row in lines[start - 1:end]:
+        if "|" in row:
+            fields = split_table_row(row)
+            # Every table row must carry the column (else the source drifted / is
+            # ragged) and must keep at least one column after the delete.
+            if col >= len(fields):
+                return 409, dict(_STALE)
+            if len(fields) <= 1:
+                return 400, {"error": "last_column", "message": "a table needs at least one column"}
+            fields.pop(col)
+            removed = True
+            new_slice.append(_rejoin_row(row, fields))
+        else:
+            new_slice.append(row)
+    if not removed:
+        return 409, dict(_STALE)
+
+    new_lines = lines[:start - 1] + new_slice + lines[end:]
+    _write_lines(source_path, new_lines, trailing_newline, newline)
+    _push_undo(source_path, {
+        "label": "coldelete", "at": start - 1, "remove": len(new_slice),
+        "insert": lines[start - 1:end], "expect": new_slice,
+        "trailing": trailing_newline, "newline": newline,
+    })
+    return 200, {"ok": True, "op": "coldelete", "start": start, "end": end, "col": col, "line_delta": 0}
 
 
 def _apply_delete(

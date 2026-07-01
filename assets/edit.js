@@ -205,7 +205,10 @@
       ["code", "<>", "Inline code"],
       ["link", "Link", "Link (add / edit / remove)"],
       ["list", "List", "Toggle bullet list"],
-      ["delete", "Delete", "Delete this block (undo with Cmd/Ctrl+Z)"]
+      ["delete", "Delete", "Delete this block (undo with Cmd/Ctrl+Z)"],
+      ["clearcell", "Clear", "Clear this cell"],
+      ["delrow", "− Row", "Delete this row"],
+      ["delcol", "− Col", "Delete this column"]
     ];
     buttons.forEach(function (spec) {
       var b = el("button", null, spec[1]);
@@ -220,6 +223,9 @@
       });
       if (spec[0] === "delete") toolbar.__deleteBtn = b;
       if (spec[0] === "list") toolbar.__listBtn = b;
+      if (spec[0] === "clearcell") toolbar.__clearBtn = b;
+      if (spec[0] === "delrow") toolbar.__rowBtn = b;
+      if (spec[0] === "delcol") toolbar.__colBtn = b;
       toolbar.appendChild(b);
     });
     document.body.appendChild(toolbar);
@@ -242,6 +248,18 @@
       toolbar.__listBtn.style.display = listable ? "" : "none";
       toolbar.__listBtn.classList.toggle("webdoc-cmd-on", t === "listitem");
     }
+    // Table-cell actions, shown only for a cell. Row delete is data-rows only:
+    // a header cell (<th>) can't remove the header row.
+    var isCell = target.dataset.mdType === "tablecell";
+    var row = isCell && target.closest ? target.closest("tr") : null;
+    if (toolbar.__clearBtn) toolbar.__clearBtn.style.display = isCell ? "" : "none";
+    // Column delete is hidden when the table has only one column (deleting it
+    // would leave no columns - the server also refuses).
+    if (toolbar.__colBtn) {
+      var oneCol = row && row.children.length <= 1;
+      toolbar.__colBtn.style.display = (isCell && !oneCol) ? "" : "none";
+    }
+    if (toolbar.__rowBtn) toolbar.__rowBtn.style.display = (isCell && target.tagName === "TD") ? "" : "none";
     var r = pageRect(target);
     // Measure, then place above the block (fall back to below near the top).
     var tw = toolbar.offsetWidth;
@@ -275,6 +293,12 @@
       toggleList();
     } else if (cmd === "delete") {
       deleteBlock();
+    } else if (cmd === "clearcell") {
+      clearCell();
+    } else if (cmd === "delrow") {
+      deleteRow();
+    } else if (cmd === "delcol") {
+      deleteColumn();
     }
   }
 
@@ -604,6 +628,140 @@
       if (r.newUl.parentNode) r.newUl.parentNode.removeChild(r.newUl);
     }
     if (r.p.parentNode) r.p.parentNode.removeChild(r.p);
+  }
+
+  // -- table cell actions (clear cell / delete row / delete column) --------
+
+  // Clear a cell: empty it and save through the normal table-cell edit path
+  // (which allows an empty cell and pushes a "cell" undo entry).
+  function clearCell() {
+    var cell = state.active;
+    if (!cell || cell.dataset.mdType !== "tablecell" || cell.innerHTML === "") return;
+    cell.innerHTML = "";
+    state.active = null;
+    commit(cell);
+  }
+
+  function deleteRow() {
+    var cell = state.active;
+    if (!cell || cell.dataset.mdType !== "tablecell" || cell.tagName !== "TD") return;
+    var row = cell.closest("tr");
+    if (!row) return;
+    var line = parseInt(cell.dataset.mdLine, 10);
+    var col = parseInt(cell.dataset.mdCell, 10);
+    var hash = cell.dataset.mdHash;
+    var parent = row.parentNode, nextSibling = row.nextSibling;
+    state.active = null;
+    deactivate(cell);
+    pendingSaves++;
+    setStatus(cell, "saving", "deleting…");
+    fetch("/api/edit", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ op: "rowdelete", line: line, cell: col, hash: hash })
+    }).then(function (resp) {
+      return resp.json().catch(function () { return {}; }).then(function (body) {
+        return { status: resp.status, ok: resp.ok, body: body };
+      });
+    }).then(function (res) {
+      if (res.status === 409) { onConflict(cell, res.body); return; }
+      if (!res.ok || !res.body || !res.body.ok) {
+        if (res.status === 403 && res.body && res.body.error === "loopback_only") showLanNotice();
+        else setStatus(cell, "error", friendlyError(res.body));
+        return;
+      }
+      if (cell.__wdStatus) { cell.__wdStatus.remove(); cell.__wdStatus = null; }
+      if (parent) parent.removeChild(row);
+      shiftFollowing(line, res.body.line_delta || 0, null);
+      pushUndo({ label: "rowdelete", row: row, parent: parent, nextSibling: nextSibling });
+      updateCount();
+      flash("Row deleted. Undo with Cmd/Ctrl+Z.");
+    }).catch(function () {
+      setStatus(cell, "error", "couldn't delete (offline?)");
+    }).finally(function () {
+      pendingSaves--;
+    });
+  }
+
+  function deleteColumn() {
+    var cell = state.active;
+    if (!cell || cell.dataset.mdType !== "tablecell") return;
+    var table = cell.closest("table");
+    if (!table) return;
+    var col = parseInt(cell.dataset.mdCell, 10);
+    var line = parseInt(cell.dataset.mdLine, 10);
+    var hash = cell.dataset.mdHash;
+    // the table's source line range, from its cells' data-md-line
+    var minLine = Infinity, maxLine = -Infinity;
+    table.querySelectorAll("[data-md-line]").forEach(function (c) {
+      var l = parseInt(c.dataset.mdLine, 10);
+      if (l < minLine) minLine = l;
+      if (l > maxLine) maxLine = l;
+    });
+    state.active = null;
+    deactivate(cell);
+    pendingSaves++;
+    setStatus(cell, "saving", "deleting…");
+    fetch("/api/edit", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        // The separator row is always minLine+1 and carries no cell, so a header-
+        // only table (no data rows, maxLine==minLine) still includes it in range.
+        op: "coldelete", start: minLine, end: Math.max(maxLine, minLine + 1),
+        col: col, line: line, cell: col, hash: hash
+      })
+    }).then(function (resp) {
+      return resp.json().catch(function () { return {}; }).then(function (body) {
+        return { status: resp.status, ok: resp.ok, body: body };
+      });
+    }).then(function (res) {
+      if (res.status === 409) { onConflict(cell, res.body); return; }
+      if (!res.ok || !res.body || !res.body.ok) {
+        if (res.status === 403 && res.body && res.body.error === "loopback_only") showLanNotice();
+        else setStatus(cell, "error", friendlyError(res.body));
+        return;
+      }
+      if (cell.__wdStatus) { cell.__wdStatus.remove(); cell.__wdStatus = null; }
+      var removed = removeColumnCells(table, col);
+      pushUndo({ label: "coldelete", table: table, col: col, removed: removed });
+      updateCount();
+      flash("Column deleted. Undo with Cmd/Ctrl+Z.");
+    }).catch(function () {
+      setStatus(cell, "error", "couldn't delete (offline?)");
+    }).finally(function () {
+      pendingSaves--;
+    });
+  }
+
+  // Remove the col-th cell from every row, decrementing the column index of the
+  // cells after it. Returns the removed cells (row + position) for undo.
+  function removeColumnCells(table, col) {
+    var removed = [];
+    table.querySelectorAll("tr").forEach(function (tr) {
+      var kids = [];
+      for (var k = 0; k < tr.children.length; k++) kids.push(tr.children[k]);
+      if (col >= kids.length) return;
+      var target = kids[col];
+      removed.push({ tr: tr, cell: target, nextSibling: target.nextSibling });
+      for (var i = col + 1; i < kids.length; i++) {
+        if (kids[i].dataset && kids[i].dataset.mdCell != null) {
+          kids[i].dataset.mdCell = String(parseInt(kids[i].dataset.mdCell, 10) - 1);
+        }
+      }
+      tr.removeChild(target);
+    });
+    return removed;
+  }
+
+  function restoreColumnCells(entry) {
+    entry.removed.forEach(function (r) {
+      for (var k = 0; k < r.tr.children.length; k++) {
+        var c = r.tr.children[k];
+        if (c.dataset && c.dataset.mdCell != null && parseInt(c.dataset.mdCell, 10) >= entry.col) {
+          c.dataset.mdCell = String(parseInt(c.dataset.mdCell, 10) + 1);
+        }
+      }
+      r.tr.insertBefore(r.cell, r.nextSibling);
+    });
   }
 
   // -- SVG diagram label editing (input overlay) ---------------------------
@@ -1118,7 +1276,8 @@
   function undoEntryMatches(entry, body) {
     if (body.label !== entry.label) return false;
     if (entry.label === "cell") return body.line === entry.line && body.cell === entry.cell;
-    if (entry.label === "space" || entry.label === "svgtext") return true; // splice-level
+    if (entry.label === "space" || entry.label === "svgtext" ||
+        entry.label === "rowdelete" || entry.label === "coldelete") return true; // splice-level
     return body.new_start === entry.expectStart; // edit + delete + retype
   }
 
@@ -1151,6 +1310,19 @@
         shiftFollowing(body.shift_threshold, body.line_delta, null);
       }
       setStatus(entry.node, "saved", "undone");
+      updateCount();
+      return;
+    }
+    if (entry.label === "rowdelete") {
+      // Shift the following rows back first (while the row is out of the DOM),
+      // then re-insert it (its cells keep their original data-md-line).
+      shiftFollowing(body.shift_threshold, body.line_delta || 0, null);
+      if (entry.parent) entry.parent.insertBefore(entry.row, entry.nextSibling || null);
+      updateCount();
+      return;
+    }
+    if (entry.label === "coldelete") {
+      restoreColumnCells(entry);
       updateCount();
       return;
     }

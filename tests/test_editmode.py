@@ -1126,6 +1126,119 @@ def _():
     eq(src.read_text(encoding="utf-8"), text, "file unchanged throughout")
 
 
+# --------------------------------------------------------------------------- #
+# Table row / column delete (op="rowdelete" / "coldelete")
+# --------------------------------------------------------------------------- #
+
+@test("rowdelete: removes a data row (not header/separator) and undoes")
+def _():
+    text = "| A | B |\n| --- | --- |\n| x | y |\n| p | q |\n"
+    src = write_md(text)
+    field = create_site.split_table_row(text.splitlines()[2])[0]  # "x" (row 3, cell 0)
+    status, _ = edit_support.apply_edit(src, {
+        "op": "rowdelete", "line": 3, "cell": 0, "hash": block_hash(field)})
+    eq(status, 200, "status")
+    eq(src.read_text(encoding="utf-8"), "| A | B |\n| --- | --- |\n| p | q |\n", "row x/y removed")
+    st2, b2 = edit_support.apply_edit(src, {"op": "rowdelete", "line": 2, "cell": 0, "hash": "x"})
+    eq(st2, 400, "the separator row is not deletable")
+    eq(b2["error"], "bad_row", "error")
+    # the header row (line 1, the one before the separator) is not deletable either
+    st3, b3 = edit_support.apply_edit(src, {"op": "rowdelete", "line": 1, "cell": 0, "hash": "x"})
+    eq(st3, 400, "the header row is not deletable")
+    eq(b3["error"], "bad_row", "error")
+    edit_support.apply_undo(src)
+    eq(src.read_text(encoding="utf-8"), text, "undo restores the row byte-identical")
+
+
+@test("rowdelete: a data row above an all-dashes divider row is still deletable")
+def _():
+    # line 4 is a legit data row that is all dashes (a divider); the header
+    # heuristic must not mistake line 3 (above it) for a header.
+    text = "| A | B |\n| --- | --- |\n| x | y |\n| --- | --- |\n| p | q |\n"
+    src = write_md(text)
+    field = create_site.split_table_row(text.splitlines()[2])[0]  # "x" on line 3
+    status, _ = edit_support.apply_edit(src, {
+        "op": "rowdelete", "line": 3, "cell": 0, "hash": block_hash(field)})
+    eq(status, 200, "the data row above an all-dashes row deletes")
+    eq(src.read_text(encoding="utf-8"),
+       "| A | B |\n| --- | --- |\n| --- | --- |\n| p | q |\n", "row x/y removed")
+
+
+@test("coldelete: refuses to delete the last column; strips a header-only table's separator")
+def _():
+    # one-column table: deleting the column would leave zero columns -> refused.
+    one = "| A |\n| --- |\n| x |\n"
+    src = write_md(one)
+    st, bd = edit_support.apply_edit(src, {
+        "op": "coldelete", "start": 1, "end": 3, "col": 0, "line": 1, "cell": 0,
+        "hash": block_hash("A")})
+    eq(st, 400, "can't delete the last column")
+    eq(bd["error"], "last_column", "error")
+    eq(src.read_text(encoding="utf-8"), one, "unchanged")
+
+    # header-only table (no data rows): the client's range includes the separator
+    # (start..start+1), so BOTH the header and the separator drop the column.
+    hdr = "| A | B |\n| --- | --- |\n"
+    src2 = write_md(hdr)
+    st2, _ = edit_support.apply_edit(src2, {
+        "op": "coldelete", "start": 1, "end": 2, "col": 1, "line": 1, "cell": 1,
+        "hash": block_hash("B")})
+    eq(st2, 200, "status")
+    eq(src2.read_text(encoding="utf-8"), "| A |\n| --- |\n", "header AND separator lost the column")
+
+
+@test("coldelete: a ragged/short row in range is rejected (409)")
+def _():
+    # a data row with fewer fields than the header (drift) -> refuse, no write.
+    text = "| A | B | C |\n| --- | --- | --- |\n| x | y |\n"
+    src = write_md(text)
+    st, _ = edit_support.apply_edit(src, {
+        "op": "coldelete", "start": 1, "end": 3, "col": 2, "line": 1, "cell": 2,
+        "hash": block_hash("C")})
+    eq(st, 409, "ragged row rejected")
+    eq(src.read_text(encoding="utf-8"), text, "unchanged")
+
+
+@test("rowdelete: 409 on a stale cell hash, nothing removed")
+def _():
+    text = "| A | B |\n| --- | --- |\n| x | y |\n"
+    src = write_md(text)
+    status, _ = edit_support.apply_edit(src, {"op": "rowdelete", "line": 3, "cell": 0, "hash": "nope"})
+    eq(status, 409, "stale")
+    eq(src.read_text(encoding="utf-8"), text, "unchanged")
+
+
+@test("coldelete: removes a column from every row (header/sep/data) and undoes")
+def _():
+    text = "| A | B | C |\n| --- | --- | --- |\n| x | y | z |\n"
+    src = write_md(text)
+    field = create_site.split_table_row(text.splitlines()[0])[1]  # "B" (header, cell 1)
+    status, body = edit_support.apply_edit(src, {
+        "op": "coldelete", "start": 1, "end": 3, "col": 1, "line": 1, "cell": 1,
+        "hash": block_hash(field)})
+    eq(status, 200, "status")
+    eq(body["line_delta"], 0, "column delete never changes line count")
+    eq(src.read_text(encoding="utf-8"), "| A | C |\n| --- | --- |\n| x | z |\n",
+       "column B stripped from header, separator, and data")
+    edit_support.apply_undo(src)
+    eq(src.read_text(encoding="utf-8"), text, "undo restores the column byte-identical")
+
+
+@test("coldelete: 409 on a stale hash; out-of-range column is a no-op 409")
+def _():
+    text = "| A | B |\n| --- | --- |\n| x | y |\n"
+    src = write_md(text)
+    eq(edit_support.apply_edit(src, {
+        "op": "coldelete", "start": 1, "end": 3, "col": 0, "line": 1, "cell": 0, "hash": "bad"})[0],
+       409, "stale hash")
+    # col 9 exists in no row -> nothing removed -> 409
+    field = create_site.split_table_row(text.splitlines()[0])[0]
+    eq(edit_support.apply_edit(src, {
+        "op": "coldelete", "start": 1, "end": 3, "col": 9, "line": 1, "cell": 0,
+        "hash": block_hash(field)})[0], 409, "no column removed")
+    eq(src.read_text(encoding="utf-8"), text, "unchanged throughout")
+
+
 def main() -> int:
     print(f"editmode test suite  ({len(TESTS)} tests)")
     print(f"  modules: {SCRIPTS}")
