@@ -202,6 +202,7 @@
       ["strike", "S", "Strikethrough"],
       ["code", "<>", "Inline code"],
       ["link", "Link", "Link (add / edit / remove)"],
+      ["list", "List", "Toggle bullet list"],
       ["delete", "Delete", "Delete this block (undo with Cmd/Ctrl+Z)"]
     ];
     buttons.forEach(function (spec) {
@@ -216,6 +217,7 @@
         runCommand(spec[0]);
       });
       if (spec[0] === "delete") toolbar.__deleteBtn = b;
+      if (spec[0] === "list") toolbar.__listBtn = b;
       toolbar.appendChild(b);
     });
     document.body.appendChild(toolbar);
@@ -229,6 +231,14 @@
     if (toolbar.__deleteBtn) {
       toolbar.__deleteBtn.style.display =
         target.dataset.mdType === "tablecell" ? "none" : "";
+    }
+    // List toggles paragraph <-> bullet item; only those two types qualify. It
+    // reads as pressed when the active block is already a list item.
+    if (toolbar.__listBtn) {
+      var t = target.dataset.mdType;
+      var listable = t === "paragraph" || t === "listitem";
+      toolbar.__listBtn.style.display = listable ? "" : "none";
+      toolbar.__listBtn.classList.toggle("webdoc-cmd-on", t === "listitem");
     }
     var r = pageRect(target);
     // Measure, then place above the block (fall back to below near the top).
@@ -259,6 +269,8 @@
       toggleInlineCode();
     } else if (cmd === "link") {
       openLinkPopover();
+    } else if (cmd === "list") {
+      toggleList();
     } else if (cmd === "delete") {
       deleteBlock();
     }
@@ -454,6 +466,142 @@
     }).finally(function () {
       pendingSaves--;
     });
+  }
+
+  // -- list toggle (paragraph <-> bullet item) -----------------------------
+
+  function setBlockAttrs(node, type, body) {
+    node.dataset.mdType = type;
+    if (body.new_start != null) node.dataset.mdStart = body.new_start;
+    if (body.new_end != null) node.dataset.mdEnd = body.new_end;
+    if (body.new_hash != null) node.dataset.mdHash = body.new_hash;
+  }
+
+  // Convert the active paragraph to a bullet item, or a list item back to a
+  // paragraph. The block's text is preserved; only its type (and its enclosing
+  // <ul>/<ol>) changes. Undoable: the swap records how to reverse the DOM surgery.
+  function toggleList() {
+    var block = state.active;
+    if (!block) return;
+    var type = block.dataset.mdType;
+    if (type !== "paragraph" && type !== "listitem") return;
+    var target = type === "paragraph" ? "listitem" : "paragraph";
+    var htmlNow = block.innerHTML;
+    var prevEdited = block.hasAttribute("data-webdoc-edited");
+    var start = parseInt(block.dataset.mdStart, 10);
+    var oldEnd = parseInt(block.dataset.mdEnd, 10);
+
+    state.active = null; // this block element is being replaced; stop tracking it
+    deactivate(block);
+    pendingSaves++;
+    setStatus(block, "saving", "converting…");
+    fetch("/api/edit", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        op: "retype", type: type, target: target,
+        start: start, end: oldEnd, hash: block.dataset.mdHash, html: htmlNow
+      })
+    }).then(function (resp) {
+      return resp.json().catch(function () { return {}; }).then(function (body) {
+        return { status: resp.status, ok: resp.ok, body: body };
+      });
+    }).then(function (res) {
+      if (res.status === 409) { onConflict(block, res.body); return; }
+      if (!res.ok || !res.body || !res.body.ok) {
+        if (res.status === 403 && res.body && res.body.error === "loopback_only") showLanNotice();
+        else setStatus(block, "error", friendlyError(res.body));
+        return; // block is untouched in the DOM; click it again to retry
+      }
+      if (block.__wdStatus) { block.__wdStatus.remove(); block.__wdStatus = null; }
+      if (block.__wdLint) { block.__wdLint.remove(); block.__wdLint = null; }
+      var swap = target === "listitem" ? swapToListItem(block, res.body)
+                                       : swapToParagraph(block, res.body);
+      shiftFollowing(oldEnd, res.body.line_delta || 0, swap.newNode);
+      if (prevEdited) swap.newNode.setAttribute("data-webdoc-edited", "1");
+      pushUndo({
+        label: "retype", newNode: swap.newNode, oldNode: swap.oldNode,
+        reverse: swap.reverse, prevEdited: prevEdited, expectStart: start
+      });
+      setStatus(swap.newNode, "saved", target === "listitem" ? "listed" : "unlisted");
+      updateCount();
+    }).catch(function () {
+      setStatus(block, "error", "couldn't convert (offline?)");
+    }).finally(function () {
+      pendingSaves--;
+    });
+  }
+
+  // paragraph -> list item: wrap it in a fresh standalone <ul>; drop the <p>.
+  // Always standalone (never merged into an adjacent list): the paragraph's blank
+  // line separators keep it a separate list in source, and the renderer breaks a
+  // list on any blank line, so a rebuild renders a standalone list too - merging
+  // live would diverge from the rebuilt page. `reverse` restores the <p>.
+  function swapToListItem(p, body) {
+    var li = el("li");
+    li.innerHTML = body.new_html;
+    setBlockAttrs(li, "listitem", body);
+    var parent = p.parentNode, nextSibling = p.nextSibling;
+    var ul = el("ul");
+    ul.appendChild(li);
+    parent.insertBefore(ul, p);
+    parent.removeChild(p);
+    return { newNode: li, oldNode: p, reverse: { p: p, parent: parent, nextSibling: nextSibling, dropUl: ul } };
+  }
+
+  function unswapListItem(r) {
+    if (r.dropUl && r.dropUl.parentNode) r.dropUl.parentNode.removeChild(r.dropUl);
+    r.parent.insertBefore(r.p, r.nextSibling);
+  }
+
+  // list item -> paragraph: pull the item out of its list, splitting the list if
+  // it was in the middle. `reverse` rebuilds the list around the restored <li>.
+  function swapToParagraph(li, body) {
+    var p = el("p");
+    p.innerHTML = body.new_html;
+    setBlockAttrs(p, "paragraph", body);
+    var ul = li.parentNode;                 // <ul>/<ol>
+    var container = ul.parentNode;
+    var items = [];
+    for (var i = 0; i < ul.children.length; i++) items.push(ul.children[i]);
+    var idx = items.indexOf(li);
+    var reverse;
+    if (items.length === 1) {
+      container.insertBefore(p, ul);
+      container.removeChild(ul);            // ul still holds li, kept for undo
+      reverse = { kind: "restore-ul", ul: ul, p: p };
+    } else if (idx === 0) {
+      container.insertBefore(p, ul);
+      ul.removeChild(li);
+      reverse = { kind: "first", ul: ul, li: li, p: p };
+    } else if (idx === items.length - 1) {
+      container.insertBefore(p, ul.nextSibling);
+      ul.removeChild(li);
+      reverse = { kind: "last", ul: ul, li: li, p: p };
+    } else {
+      var newUl = el(ul.tagName.toLowerCase());
+      for (var j = idx + 1; j < items.length; j++) newUl.appendChild(items[j]);
+      ul.removeChild(li);
+      container.insertBefore(p, ul.nextSibling);
+      container.insertBefore(newUl, p.nextSibling);
+      reverse = { kind: "split", ul: ul, newUl: newUl, li: li, p: p };
+    }
+    return { newNode: p, oldNode: li, reverse: reverse };
+  }
+
+  function unswapParagraph(r) {
+    if (r.kind === "restore-ul") {
+      r.p.parentNode.insertBefore(r.ul, r.p); // ul still contains li
+    } else if (r.kind === "first") {
+      r.ul.insertBefore(r.li, r.ul.firstChild);
+    } else if (r.kind === "last") {
+      r.ul.appendChild(r.li);
+    } else { // split: put li back, fold newUl's items after it, drop newUl
+      r.ul.appendChild(r.li);
+      while (r.newUl.firstChild) r.ul.appendChild(r.newUl.firstChild);
+      if (r.newUl.parentNode) r.newUl.parentNode.removeChild(r.newUl);
+    }
+    if (r.p.parentNode) r.p.parentNode.removeChild(r.p);
   }
 
   // -- link popover (add / edit / remove) ----------------------------------
@@ -892,6 +1040,18 @@
       }
       shiftFollowing(body.shift_threshold, body.line_delta || 0, null);
       setStatus(entry.block, "saved", "undone");
+      updateCount();
+      return;
+    }
+    if (entry.label === "retype") {
+      // Reverse the element swap: restore the original block, drop the new one.
+      if (entry.newNode.tagName === "LI") unswapListItem(entry.reverse);
+      else unswapParagraph(entry.reverse);
+      var restored = entry.oldNode;
+      setRangeAttrs(restored, body); // original start/end/hash from the server
+      shiftFollowing(body.shift_threshold, body.line_delta || 0, restored);
+      restoreEdited(restored, entry.prevEdited);
+      setStatus(restored, "saved", "undone");
       updateCount();
       return;
     }

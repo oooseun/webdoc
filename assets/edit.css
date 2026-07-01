@@ -245,8 +245,15 @@ body.webdoc-edit-on .webdoc-conflict {
 }
 
 .webdoc-toolbar button[data-cmd="delete"],
-.webdoc-toolbar button[data-cmd="link"] {
+.webdoc-toolbar button[data-cmd="link"],
+.webdoc-toolbar button[data-cmd="list"] {
   font-size: 0.78rem;
+}
+
+/* "List" reads as pressed when the active block is already a bullet item. */
+.webdoc-toolbar button.webdoc-cmd-on {
+  background: #d6efe9;
+  color: #0b5d56;
 }
 
 /* Delete is destructive: tint it red so it reads apart from the formatting

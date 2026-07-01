@@ -971,6 +971,86 @@ def _():
     eq(idx.count("webdoc-gap"), 1, "the authored gap still renders after rebuild")
 
 
+# --------------------------------------------------------------------------- #
+# Retype (op="retype") - the list toolbar button (paragraph <-> list item)
+# --------------------------------------------------------------------------- #
+
+@test("retype: paragraph -> list item adds the bullet marker")
+def _():
+    text = "Plain text.\n"
+    src = write_md(text)
+    status, body = edit_support.apply_edit(src, {
+        "op": "retype", "type": "paragraph", "target": "listitem", "start": 1, "end": 1,
+        "hash": slice_hash(text, 1, 1), "html": "Plain text."})
+    eq(status, 200, "status")
+    eq(body["type"], "listitem", "new type")
+    eq(src.read_text(encoding="utf-8"), "- Plain text.\n", "bullet marker added")
+
+
+@test("retype: list item -> paragraph strips the marker")
+def _():
+    text = "- Item text.\n"
+    src = write_md(text)
+    status, body = edit_support.apply_edit(src, {
+        "op": "retype", "type": "listitem", "target": "paragraph", "start": 1, "end": 1,
+        "hash": slice_hash(text, 1, 1), "html": "Item text."})
+    eq(status, 200, "status")
+    eq(body["type"], "paragraph", "new type")
+    eq(src.read_text(encoding="utf-8"), "Item text.\n", "marker stripped")
+
+
+@test("retype: ordered list item -> paragraph, sibling intact")
+def _():
+    text = "1. First.\n2. Second.\n"
+    src = write_md(text)
+    status, _ = edit_support.apply_edit(src, {
+        "op": "retype", "type": "listitem", "target": "paragraph", "start": 1, "end": 1,
+        "hash": slice_hash(text, 1, 1), "html": "First."})
+    eq(status, 200, "status")
+    eq(src.read_text(encoding="utf-8"), "First.\n2. Second.\n", "first -> paragraph, second intact")
+
+
+@test("retype: same-type or unsupported type is rejected (bad_retype)")
+def _():
+    text = "Para.\n"
+    src = write_md(text)
+    for pl in [
+        {"type": "paragraph", "target": "paragraph"},
+        {"type": "heading", "target": "listitem"},
+        {"type": "paragraph", "target": "tablecell"},
+    ]:
+        status, body = edit_support.apply_edit(src, dict(
+            op="retype", start=1, end=1, hash=slice_hash(text, 1, 1), html="Para.", **pl))
+        eq(status, 400, f"rejected {pl['type']}->{pl['target']}")
+        eq(body["error"], "bad_retype", "error")
+    eq(src.read_text(encoding="utf-8"), text, "unchanged")
+
+
+@test("retype: undo restores the original type and bytes")
+def _():
+    text = "Convert me.\n"
+    src = write_md(text)
+    edit_support.apply_edit(src, {
+        "op": "retype", "type": "paragraph", "target": "listitem", "start": 1, "end": 1,
+        "hash": slice_hash(text, 1, 1), "html": "Convert me."})
+    eq(src.read_text(encoding="utf-8"), "- Convert me.\n", "converted to a list item")
+    status, body = edit_support.apply_undo(src)
+    eq(status, 200, "undo status")
+    eq(body["label"], "retype", "undo carries the retype label")
+    eq(src.read_text(encoding="utf-8"), text, "restored to the paragraph")
+
+
+@test("edit: emptying a block is rejected with a message pointing to Delete")
+def _():
+    text = "Keep me.\n"
+    src = write_md(text)
+    status, body = edit_support.apply_edit(src, {
+        "type": "paragraph", "start": 1, "end": 1, "hash": slice_hash(text, 1, 1), "html": "  "})
+    eq(status, 400, "status")
+    eq(body["error"], "empty_block", "error")
+    assert "Delete" in body.get("message", ""), f"message guides to Delete: {body.get('message')!r}"
+
+
 def main() -> int:
     print(f"editmode test suite  ({len(TESTS)} tests)")
     print(f"  modules: {SCRIPTS}")

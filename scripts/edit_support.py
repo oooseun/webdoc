@@ -42,6 +42,8 @@ ALL_TYPES = RANGE_TYPES | {"tablecell"}
 # so inserting one would split the list (and renumber an ordered one) instead of
 # adding a gap. Delete still works on list items (it removes the whole line).
 _SPACE_TYPES = {"paragraph", "heading"}
+# Retype (the list toolbar button) toggles a block between these two types.
+_RETYPE_TYPES = {"paragraph", "listitem"}
 _STALE = {"error": "stale_block", "message": "this block changed on disk — reload"}
 
 _HEADING_PREFIX = re.compile(r"^(\s*#{1,6}\s+)")
@@ -284,6 +286,12 @@ def apply_edit(source_path: str | Path, payload: dict) -> tuple[int, dict]:
         # Spacing is paragraph/heading only (a blank would split a list).
         if btype not in _SPACE_TYPES:
             return 400, {"error": "bad_type"}
+    elif op == "retype":
+        # The list button toggles paragraph <-> list item; both types required,
+        # and the target must differ from the current type.
+        target_type = str(payload.get("target", ""))
+        if btype not in _RETYPE_TYPES or target_type not in _RETYPE_TYPES or target_type == btype:
+            return 400, {"error": "bad_retype"}
     elif btype not in ALL_TYPES:
         return 400, {"error": "bad_type"}
 
@@ -306,6 +314,14 @@ def apply_edit(source_path: str | Path, payload: dict) -> tuple[int, dict]:
 
     flat = flatten(html_to_markdown(str(payload.get("html", ""))))
 
+    if op == "retype":
+        # Re-wrap the block's text with the TARGET type's structural prefix
+        # (paragraph -> "- x", list item -> "x"). Same surgical round-trip as an
+        # edit; undo is labelled "retype" so the client reverses the element swap.
+        target_type = str(payload.get("target", ""))
+        return _apply_range(source_path, lines, trailing_newline, payload,
+                            target_type, flat, newline, undo_label="retype")
+
     if btype == "tablecell":
         return _apply_cell(source_path, lines, trailing_newline, payload, flat, newline)
     return _apply_range(source_path, lines, trailing_newline, payload, btype, flat, newline)
@@ -319,6 +335,7 @@ def _apply_range(
     btype: str,
     flat: str,
     newline: str = "\n",
+    undo_label: str = "edit",
 ) -> tuple[int, dict]:
     try:
         start = int(payload["start"])
@@ -332,7 +349,8 @@ def _apply_range(
     if block_hash("\n".join(original_slice)) != str(payload.get("hash", "")):
         return 409, dict(_STALE)
     if not flat:
-        return 400, {"error": "empty_block", "message": "a block cannot be emptied in edit mode"}
+        return 400, {"error": "empty_block",
+                     "message": "To remove a block, use the Delete button (a block can't be emptied)."}
 
     new_block = rewrap_range(btype, original_slice, flat)
     new_lines = lines[:start - 1] + new_block + lines[end:]
@@ -343,9 +361,10 @@ def _apply_range(
     # `expect` is the content undo will remove (the lines we wrote): undo verifies
     # the file still holds exactly this before splicing, so an out-of-band edit
     # cannot make a stale-but-in-bounds splice clobber the wrong lines. `trailing`
-    # restores the file's exact trailing-newline state.
+    # restores the file's exact trailing-newline state. `undo_label` is "retype"
+    # for a list<->paragraph conversion so the client reverses the DOM element swap.
     _push_undo(source_path, {
-        "label": "edit",
+        "label": undo_label,
         "at": start - 1,
         "remove": len(new_block),
         "insert": original_slice,
