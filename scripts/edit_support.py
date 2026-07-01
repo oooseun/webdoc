@@ -321,10 +321,13 @@ def apply_edit(source_path: str | Path, payload: dict) -> tuple[int, dict]:
     flat = flatten(html_to_markdown(str(payload.get("html", ""))))
 
     if op == "retype":
-        # Re-wrap the block's text with the TARGET type's structural prefix
-        # (paragraph -> "- x", list item -> "x"). Same surgical round-trip as an
-        # edit; undo is labelled "retype" so the client reverses the element swap.
+        # paragraph -> list item is a clean prefix add (one line). list item ->
+        # paragraph blank-separates the pulled-out paragraph from adjacent list
+        # markers so the source is CommonMark-portable, not just webdoc-parseable.
+        # Undo is labelled "retype" so the client reverses the element swap.
         target_type = str(payload.get("target", ""))
+        if target_type == "paragraph":
+            return _apply_delist(source_path, lines, trailing_newline, payload, flat, newline)
         return _apply_range(source_path, lines, trailing_newline, payload,
                             target_type, flat, newline, undo_label="retype")
 
@@ -610,6 +613,62 @@ def _apply_space(
         }
 
     return 400, {"error": "bad_dir"}
+
+
+def _apply_delist(
+    source_path: Path,
+    lines: list[str],
+    trailing_newline: bool,
+    payload: dict,
+    flat: str,
+    newline: str = "\n",
+) -> tuple[int, dict]:
+    """Convert a list item to a paragraph, blank-separating it from any adjacent
+    list markers.
+
+    Writing just the bare text ("- a\\ntext\\n- c") renders correctly in webdoc's
+    own line-based parser but is a *lazy continuation* in CommonMark (GitHub, VS
+    Code, pandoc would merge it into the item above). Inserting a blank line on
+    each side that touches a list marker keeps the split portable, and a single
+    blank renders no gap, so webdoc's own output is unchanged."""
+    try:
+        start = int(payload["start"])
+        end = int(payload["end"])
+    except (KeyError, TypeError, ValueError):
+        return 400, {"error": "bad_range"}
+    if start < 1 or end < start or end > len(lines):
+        return 409, dict(_STALE)
+    original_slice = lines[start - 1:end]
+    if block_hash("\n".join(original_slice)) != str(payload.get("hash", "")):
+        return 409, dict(_STALE)
+    if not flat:
+        return 400, {"error": "empty_block",
+                     "message": "To remove a block, use the Delete button (a block can't be emptied)."}
+
+    para = ("\\" + flat) if _LEADING_BLOCK.match(flat) else flat
+    need_before = start > 1 and bool(_LIST_PREFIX.match(lines[start - 2]))
+    need_after = end < len(lines) and bool(_LIST_PREFIX.match(lines[end]))
+    new_block = ([""] if need_before else []) + [para] + ([""] if need_after else [])
+    new_lines = lines[:start - 1] + new_block + lines[end:]
+    _write_lines(source_path, new_lines, trailing_newline, newline)
+
+    _push_undo(source_path, {
+        "label": "retype", "at": start - 1, "remove": len(new_block),
+        "insert": original_slice, "expect": new_block,
+        "trailing": trailing_newline, "newline": newline,
+    })
+
+    new_start = start + (1 if need_before else 0)
+    new_hash = block_hash(para)
+    append_ledger(source_path, {
+        "type": "paragraph", "start": new_start, "end": new_start,
+        "content_hash": new_hash, "edited_at": now_iso(), "excerpt": flat[:120],
+    })
+    return 200, {
+        "ok": True, "type": "paragraph", "new_html": inline_md(flat),
+        "new_hash": new_hash, "new_start": new_start, "new_end": new_start,
+        "line_delta": len(new_block) - len(original_slice), "lint": lint_block(flat),
+    }
 
 
 def _apply_svgtext(

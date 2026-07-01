@@ -999,15 +999,39 @@ def _():
     eq(src.read_text(encoding="utf-8"), "Item text.\n", "marker stripped")
 
 
-@test("retype: ordered list item -> paragraph, sibling intact")
+@test("retype: list->paragraph blank-separates from adjacent markers (portable)")
 def _():
+    # first item: a blank AFTER (before the next marker); none needed before.
     text = "1. First.\n2. Second.\n"
     src = write_md(text)
-    status, _ = edit_support.apply_edit(src, {
+    edit_support.apply_edit(src, {
         "op": "retype", "type": "listitem", "target": "paragraph", "start": 1, "end": 1,
         "hash": slice_hash(text, 1, 1), "html": "First."})
+    eq(src.read_text(encoding="utf-8"), "First.\n\n2. Second.\n", "blank after, before the next marker")
+
+    # middle item: a blank on BOTH sides, so a CommonMark tool splits it too
+    # (not a lazy continuation of the item above).
+    text2 = "- a\n- b\n- c\n"
+    src2 = write_md(text2)
+    status, body = edit_support.apply_edit(src2, {
+        "op": "retype", "type": "listitem", "target": "paragraph", "start": 2, "end": 2,
+        "hash": slice_hash(text2, 2, 2), "html": "b"})
     eq(status, 200, "status")
-    eq(src.read_text(encoding="utf-8"), "First.\n2. Second.\n", "first -> paragraph, second intact")
+    eq(src2.read_text(encoding="utf-8"), "- a\n\nb\n\n- c\n", "middle split has blanks both sides")
+    eq(body["new_start"], 3, "the paragraph shifted below the inserted blank")
+    eq(body["line_delta"], 2, "two blank lines added")
+    edit_support.apply_undo(src2)
+    eq(src2.read_text(encoding="utf-8"), text2, "undo restores the list byte-identical")
+
+
+@test("retype: single-item list -> paragraph needs no separators")
+def _():
+    text = "- Item text.\n"
+    src = write_md(text)
+    edit_support.apply_edit(src, {
+        "op": "retype", "type": "listitem", "target": "paragraph", "start": 1, "end": 1,
+        "hash": slice_hash(text, 1, 1), "html": "Item text."})
+    eq(src.read_text(encoding="utf-8"), "Item text.\n", "no adjacent markers, no blanks added")
 
 
 @test("retype: same-type or unsupported type is rejected (bad_retype)")
