@@ -27,7 +27,9 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
-from create_site import block_hash, cell_marker, inline_md, split_table_row
+from create_site import (
+    block_hash, cell_marker, inline_md, rewrite_svg_text, split_table_row, svg_text_at,
+)
 from html2md import html_to_markdown
 
 try:
@@ -278,7 +280,9 @@ def apply_edit(source_path: str | Path, payload: dict) -> tuple[int, dict]:
     "delete" removes a whole range block (paragraph/heading/listitem)."""
     op = str(payload.get("op", "edit"))
     btype = str(payload.get("type", ""))
-    if op == "delete":
+    if op == "svgtext":
+        pass  # a sub-element edit (an SVG label); no block type - validated below
+    elif op == "delete":
         # Delete is range-only: a table cell cannot be removed (breaks the row).
         if btype not in RANGE_TYPES:
             return 400, {"error": "bad_type"}
@@ -311,6 +315,8 @@ def apply_edit(source_path: str | Path, payload: dict) -> tuple[int, dict]:
         return _apply_delete(source_path, lines, trailing_newline, payload, btype, newline)
     if op == "space":
         return _apply_space(source_path, lines, trailing_newline, payload, btype, newline)
+    if op == "svgtext":
+        return _apply_svgtext(source_path, lines, trailing_newline, payload, newline)
 
     flat = flatten(html_to_markdown(str(payload.get("html", ""))))
 
@@ -604,6 +610,70 @@ def _apply_space(
         }
 
     return 400, {"error": "bad_dir"}
+
+
+def _apply_svgtext(
+    source_path: Path,
+    lines: list[str],
+    trailing_newline: bool,
+    payload: dict,
+    newline: str = "\n",
+) -> tuple[int, dict]:
+    """Rewrite one simple <text> label inside an embedded SVG.
+
+    `loc` is "embed_start:embed_end:idx" - the embed content's 1-based inclusive
+    source range plus the label's index among simple <text> elements (the same
+    order create_site stamps them in). Hash-checked against the label's current
+    source content (409 on drift). Undoable; the label's text is collapsed to one
+    line and XML-escaped on write, so the SVG stays valid."""
+    parts = str(payload.get("loc", "")).split(":")
+    try:
+        embed_start, embed_end, idx = int(parts[0]), int(parts[1]), int(parts[2])
+    except (IndexError, ValueError):
+        return 400, {"error": "bad_loc"}
+    if embed_start < 1 or embed_end < embed_start or embed_end > len(lines):
+        return 409, dict(_STALE)
+
+    embed_lines = lines[embed_start - 1:embed_end]
+    block = "\n".join(embed_lines)
+    current = svg_text_at(block, idx)
+    if current is None:
+        return 409, dict(_STALE)
+    if block_hash(current) != str(payload.get("hash", "")):
+        return 409, dict(_STALE)
+
+    # Collapse to one line and drop C0/DEL control chars (NUL et al. are invalid
+    # in XML and would otherwise reach the SVG source).
+    raw = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", str(payload.get("text", "")))
+    new_text = " ".join(raw.split())
+    if not new_text:
+        return 400, {"error": "empty_label", "message": "a diagram label can't be empty"}
+
+    new_block = rewrite_svg_text(block, idx, new_text)
+    if new_block is None:
+        return 409, dict(_STALE)
+    new_embed_lines = new_block.split("\n")
+    new_lines = lines[:embed_start - 1] + new_embed_lines + lines[embed_end:]
+    _write_lines(source_path, new_lines, trailing_newline, newline)
+
+    _push_undo(source_path, {
+        "label": "svgtext",
+        "at": embed_start - 1,
+        "remove": len(new_embed_lines),
+        "insert": embed_lines,
+        "expect": new_embed_lines,
+        "trailing": trailing_newline, "newline": newline,
+    })
+
+    new_embed_end = embed_start - 1 + len(new_embed_lines)
+    rendered = svg_text_at(new_block, idx)
+    return 200, {
+        "ok": True, "op": "svgtext",
+        "new_loc": f"{embed_start}:{new_embed_end}:{idx}",
+        "new_hash": block_hash(rendered if rendered is not None else new_text),
+        "new_text": new_text,
+        "line_delta": len(new_embed_lines) - len(embed_lines),
+    }
 
 
 def apply_undo(source_path: str | Path) -> tuple[int, dict]:

@@ -33,6 +33,8 @@
   var undoBtn = null;     // banner "Undo" button
   var toastEl = null;     // transient bottom note (delete confirmation, undo errors)
   var toastTimer = null;
+  var svgInput = null;    // input overlay for editing an SVG diagram label
+  var svgTarget = null;   // the <text> element being edited
 
   // Client half of the undo stack, in lockstep with the server's per-file stack.
   // Each entry holds the live DOM node so an undeleted block (incl. a list item
@@ -604,6 +606,103 @@
     if (r.p.parentNode) r.p.parentNode.removeChild(r.p);
   }
 
+  // -- SVG diagram label editing (input overlay) ---------------------------
+
+  function buildSvgInput() {
+    svgInput = el("input", "webdoc-svg-input");
+    svgInput.type = "text";
+    svgInput.hidden = true;
+    svgInput.addEventListener("keydown", function (ev) {
+      ev.stopPropagation();
+      if (ev.key === "Enter") { ev.preventDefault(); commitSvgEditor(); }
+      else if (ev.key === "Escape") { ev.preventDefault(); closeSvgEditor(); }
+    });
+    svgInput.addEventListener("blur", function () { commitSvgEditor(); });
+    document.body.appendChild(svgInput);
+  }
+
+  // SVG <text> can't be made contenteditable reliably, so edit the label through
+  // an HTML input positioned over its bounding box.
+  function openSvgEditor(label) {
+    closeSvgEditor();
+    if (!svgInput) buildSvgInput();
+    svgTarget = label;
+    svgInput.value = label.textContent;
+    var r = label.getBoundingClientRect();
+    svgInput.style.left = (r.left + window.scrollX) + "px";
+    svgInput.style.top = (r.top + window.scrollY) + "px";
+    svgInput.style.width = Math.max(60, r.width + 28) + "px";
+    svgInput.hidden = false;
+    svgInput.focus();
+    svgInput.select();
+  }
+
+  function closeSvgEditor() {
+    if (svgInput) svgInput.hidden = true;
+    svgTarget = null;
+  }
+
+  // Other labels in the same embed share its source range; a line-count-changing
+  // edit shifts their embed_end too. Bump every same-embed sibling so a follow-up
+  // edit's loc still resolves (else it could false-409 until a reload).
+  function bumpSvgSiblings(embedStart, delta, except) {
+    if (!delta) return;
+    document.querySelectorAll("[data-md-svgtext]").forEach(function (n) {
+      if (n === except) return;
+      var p = n.dataset.mdSvgtext.split(":");
+      if (parseInt(p[0], 10) === embedStart) {
+        p[1] = String(parseInt(p[1], 10) + delta);
+        n.dataset.mdSvgtext = p.join(":");
+      }
+    });
+  }
+
+  function commitSvgEditor() {
+    if (!svgTarget || !svgInput || svgInput.hidden) return;
+    var label = svgTarget;
+    var newText = svgInput.value;
+    var oldText = label.textContent;
+    var loc = label.dataset.mdSvgtext;
+    var oldHash = label.dataset.mdSvghash;
+    closeSvgEditor();
+    // Normalize the same way the server does (collapse + trim) so a whitespace-
+    // only change is a true no-op: no needless save, rebuild, or undo entry.
+    var norm = newText.replace(/\s+/g, " ").trim();
+    if (!norm || norm === oldText) return;
+    var embedStart = parseInt(loc.split(":")[0], 10);
+    var embedEndOld = parseInt(loc.split(":")[1], 10);
+    pendingSaves++;
+    fetch("/api/edit", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ op: "svgtext", loc: loc, hash: oldHash, text: newText })
+    }).then(function (resp) {
+      return resp.json().catch(function () { return {}; }).then(function (body) {
+        return { status: resp.status, ok: resp.ok, body: body };
+      });
+    }).then(function (res) {
+      if (res.status === 409) { flash("Diagram changed on disk — reload to edit."); return; }
+      if (!res.ok || !res.body || !res.body.ok) {
+        if (res.status === 403 && res.body && res.body.error === "loopback_only") showLanNotice();
+        else flash(friendlyError(res.body));
+        return;
+      }
+      label.textContent = res.body.new_text;
+      label.dataset.mdSvghash = res.body.new_hash;
+      if (res.body.new_loc) label.dataset.mdSvgtext = res.body.new_loc;
+      if (res.body.line_delta) {
+        bumpSvgSiblings(embedStart, res.body.line_delta, label);
+        shiftFollowing(embedEndOld, res.body.line_delta, null);
+      }
+      pushUndo({ label: "svgtext", node: label, prevText: oldText, prevHash: oldHash, prevLoc: loc });
+      setStatus(label, "saved", "saved ✓");
+    }).catch(function () {
+      flash("Couldn't edit the label (offline?).");
+    }).finally(function () {
+      pendingSaves--;
+    });
+  }
+
   // -- link popover (add / edit / remove) ----------------------------------
 
   // Mirror the server + html2md scheme policy: drop control/space chars, then
@@ -1019,8 +1118,8 @@
   function undoEntryMatches(entry, body) {
     if (body.label !== entry.label) return false;
     if (entry.label === "cell") return body.line === entry.line && body.cell === entry.cell;
-    if (entry.label === "space") return true; // splice-level; no block identity to compare
-    return body.new_start === entry.expectStart; // edit + delete
+    if (entry.label === "space" || entry.label === "svgtext") return true; // splice-level
+    return body.new_start === entry.expectStart; // edit + delete + retype
   }
 
   function applyUndoEntry(entry, body) {
@@ -1040,6 +1139,18 @@
       }
       shiftFollowing(body.shift_threshold, body.line_delta || 0, null);
       setStatus(entry.block, "saved", "undone");
+      updateCount();
+      return;
+    }
+    if (entry.label === "svgtext") {
+      entry.node.textContent = entry.prevText;
+      entry.node.dataset.mdSvghash = entry.prevHash;
+      entry.node.dataset.mdSvgtext = entry.prevLoc;
+      if (body.line_delta) {
+        bumpSvgSiblings(parseInt(entry.prevLoc.split(":")[0], 10), body.line_delta, entry.node);
+        shiftFollowing(body.shift_threshold, body.line_delta, null);
+      }
+      setStatus(entry.node, "saved", "undone");
       updateCount();
       return;
     }
@@ -1103,6 +1214,7 @@
     if (banner) banner.style.display = "none";
     hideToolbar();
     if (linkPopover) linkPopover.hidden = true;
+    if (svgInput && !svgInput.hidden) commitSvgEditor();
     savedRange = null;
     if (toggleBtn) toggleBtn.style.display = "";
   }
@@ -1120,6 +1232,18 @@
     // since we may be activating a different block on the same click).
     if (linkPopover && !linkPopover.hidden) { linkPopover.hidden = true; savedRange = null; }
 
+    // SVG diagram label: a click inside its input keeps editing; a click away
+    // commits it; a click on a label opens its inline input.
+    if (svgInput && !svgInput.hidden && svgInput.contains(ev.target)) return;
+    if (svgInput && !svgInput.hidden) commitSvgEditor();
+    var svgLabel = ev.target.closest ? ev.target.closest("[data-md-svgtext]") : null;
+    if (svgLabel) {
+      ev.preventDefault();
+      if (state.active) { var prevBlock = state.active; state.active = null; commit(prevBlock); }
+      openSvgEditor(svgLabel);
+      return;
+    }
+
     var block = ev.target.closest ? ev.target.closest(EDITABLE) : null;
     if (block && block.hasAttribute("data-noedit")) block = null;
     if (block === state.active) return; // moving the caret inside the active block
@@ -1135,6 +1259,7 @@
     // the capture phase (before the input's handler), so without this guard an
     // Esc/Enter in the popover would also cancel/commit the underlying block.
     if (linkPopover && !linkPopover.hidden && linkPopover.contains(ev.target)) return;
+    if (svgInput && !svgInput.hidden && svgInput.contains(ev.target)) return;
     if (!state.on) return;
     var mod = ev.metaKey || ev.ctrlKey;
     // Cross-save undo only when no block is active; while a block is being

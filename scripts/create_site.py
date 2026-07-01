@@ -333,7 +333,54 @@ def render_stepper(block: str, meta: str, mode: str, state: dict) -> str:
     )
 
 
-def render_embed(block: str, mode: str, state: dict) -> str:
+# A simple <text> label in an embedded SVG: an opening tag, plain text content
+# (no child elements like <tspan>), a closing tag. Only these are made editable -
+# a <text> with children is left view-only (its structure can't round-trip as one
+# string). [^<] matches newlines too, so a tag/content spanning lines still works.
+_SVG_TEXT_RE = re.compile(r"(<text\b[^>]*>)([^<]*)(</text>)", re.IGNORECASE)
+
+
+def _stamp_svg_text(block: str, embed_start: int, embed_end: int) -> str:
+    """Give each simple <text> in an embed an editing identity: the embed's source
+    line range plus the label's index (its order among simple <text> elements, the
+    same order the server rewrites them in) and a hash of its current text."""
+    counter = [0]
+
+    def repl(match: "re.Match[str]") -> str:
+        idx = counter[0]
+        counter[0] += 1
+        open_tag, content, close = match.group(1), match.group(2), match.group(3)
+        digest = block_hash(content)
+        stamped = (
+            open_tag[:-1]
+            + f' data-md-svgtext="{embed_start}:{embed_end}:{idx}" data-md-svghash="{digest}">'
+        )
+        return stamped + content + close
+
+    return _SVG_TEXT_RE.sub(repl, block)
+
+
+def svg_text_at(block: str, idx: int) -> "str | None":
+    """The raw source content of the idx-th simple <text> in block, or None. Same
+    indexing as _stamp_svg_text, so a stamped label and the server agree."""
+    matches = list(_SVG_TEXT_RE.finditer(block))
+    if idx < 0 or idx >= len(matches):
+        return None
+    return matches[idx].group(2)
+
+
+def rewrite_svg_text(block: str, idx: int, new_text: str) -> "str | None":
+    """Replace the idx-th simple <text>'s content with new_text (XML-escaped so it
+    stays valid SVG), leaving everything else byte-for-byte. None if out of range."""
+    matches = list(_SVG_TEXT_RE.finditer(block))
+    if idx < 0 or idx >= len(matches):
+        return None
+    m = matches[idx]
+    escaped = html.escape(new_text, quote=False)
+    return block[:m.start(2)] + escaped + block[m.end(2):]
+
+
+def render_embed(block: str, mode: str, state: dict, embed_start: int = 0, embed_end: int = 0) -> str:
     state["embed"] = True
     low = block.lower()
     if "<audio" in low:
@@ -348,8 +395,13 @@ def render_embed(block: str, mode: str, state: dict) -> str:
     if mode == "doc":
         return "<p><em>[Interactive element omitted in the document export — view the website version.]</em></p>"
     # Wrap with data-noedit so edit mode gives embeds the same view-only
-    # affordance as the stepper/code/blockquote (and never makes them editable).
-    return f'<div class="webdoc-embed" data-noedit>{block}</div>'
+    # affordance as the stepper/code/blockquote (the block itself is never a
+    # data-md-type editable). But simple SVG <text> labels inside are stamped with
+    # their own identity so they can be edited in place (see edit.js).
+    body = block
+    if embed_start and "<text" in block.lower():
+        body = _stamp_svg_text(block, embed_start, embed_end)
+    return f'<div class="webdoc-embed" data-noedit>{body}</div>'
 
 
 def _md_attrs(lines: list[str], start0: int, end0_excl: int, btype: str) -> str:
@@ -430,7 +482,13 @@ def parse_markdown(markdown: str, mode: str = "site") -> tuple[str, list[dict[st
                 out.append(render_stepper(block, meta, mode, state))
                 continue
             if language in ("embed", "component"):
-                out.append(render_embed(block, mode, state))
+                # 1-based inclusive source range of the embed's content lines, so
+                # SVG <text> labels can be stamped with a locatable identity (site
+                # mode only; doc export ignores it).
+                embed_start = block_start + 2
+                embed_end = block_start + 1 + len(code_lines)
+                stamp = embed_start if mode == "site" else 0
+                out.append(render_embed(block, mode, state, stamp, embed_end))
                 continue
             class_attr = f' class="language-{html.escape(language, quote=True)}"' if language else ""
             out.append(f"<pre{noedit}><code{class_attr}>{html.escape(block)}</code></pre>")

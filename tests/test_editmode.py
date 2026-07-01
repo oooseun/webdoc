@@ -1051,6 +1051,57 @@ def _():
     assert "Delete" in body.get("message", ""), f"message guides to Delete: {body.get('message')!r}"
 
 
+# --------------------------------------------------------------------------- #
+# Diagram-label editing (op="svgtext" + SVG <text> stamping)
+# --------------------------------------------------------------------------- #
+
+@test("svgtext: create_site stamps simple <text> labels in site mode, not doc")
+def _():
+    import re as _re
+    md = "# T\n\n```embed\n<svg><text x=\"1\">Alpha</text><text x=\"2\">Beta</text></svg>\n```\n"
+    site, _, _ = create_site.parse_markdown(md, mode="site")
+    doc, _, _ = create_site.parse_markdown(md, mode="doc")
+    eq(site.count("data-md-svgtext="), 2, "both simple labels stamped in site mode")
+    assert "data-md-svgtext" not in doc, "no stamp leaks into the doc export"
+    idxs = _re.findall(r'data-md-svgtext="[^"]*:(\d+)"', site)
+    eq(idxs, ["0", "1"], "label indices follow source order")
+    # a <text> with child elements (a tspan) is NOT stamped (not editable)
+    md2 = "# T\n\n```embed\n<svg><text><tspan>x</tspan></text></svg>\n```\n"
+    site2, _, _ = create_site.parse_markdown(md2, mode="site")
+    assert "data-md-svgtext" not in site2, "a <text> with children is left view-only"
+
+
+@test("svgtext: edits the Nth label, XML-escapes, hash-checks, and undoes")
+def _():
+    text = "# T\n\n```embed\n<svg><text x=\"1\">Alpha</text><text x=\"2\">Beta</text></svg>\n```\n"
+    src = write_md(text)
+    status, body = edit_support.apply_edit(src, {
+        "op": "svgtext", "loc": "4:4:0", "hash": create_site.block_hash("Alpha"), "text": "Gamma & <b>"})
+    eq(status, 200, "status")
+    eq(body["new_text"], "Gamma & <b>", "returns the plain text for the client")
+    written = src.read_text(encoding="utf-8")
+    assert "Gamma &amp; &lt;b&gt;" in written, f"escaped into the SVG source: {written!r}"
+    assert "Alpha" not in written and "Beta" in written, "only the first label changed"
+    status2, b2 = edit_support.apply_undo(src)
+    eq(status2, 200, "undo status")
+    eq(b2["label"], "svgtext", "undo label")
+    eq(src.read_text(encoding="utf-8"), text, "restored to exact bytes")
+
+
+@test("svgtext: bad loc, stale hash, out-of-range index, empty label are rejected")
+def _():
+    text = "# T\n\n```embed\n<svg><text>One</text></svg>\n```\n"
+    src = write_md(text)
+    eq(edit_support.apply_edit(src, {"op": "svgtext", "loc": "nope", "hash": "x", "text": "y"})[0], 400, "bad_loc")
+    eq(edit_support.apply_edit(src, {"op": "svgtext", "loc": "4:4:0", "hash": "wrong", "text": "y"})[0], 409, "stale hash")
+    eq(edit_support.apply_edit(src, {"op": "svgtext", "loc": "4:4:9", "hash": "x", "text": "y"})[0], 409, "index out of range")
+    st, bd = edit_support.apply_edit(src, {
+        "op": "svgtext", "loc": "4:4:0", "hash": create_site.block_hash("One"), "text": "   "})
+    eq(st, 400, "empty label")
+    eq(bd["error"], "empty_label", "error")
+    eq(src.read_text(encoding="utf-8"), text, "file unchanged throughout")
+
+
 def main() -> int:
     print(f"editmode test suite  ({len(TESTS)} tests)")
     print(f"  modules: {SCRIPTS}")

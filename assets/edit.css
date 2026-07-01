@@ -327,6 +327,32 @@ body.webdoc-edit-on .webdoc-gap {
   border-radius: 3px;
 }
 
+/* Editable SVG diagram labels: a caret cursor and a hover hint in edit mode; the
+   label itself is edited through an input overlay (SVG text isn't contenteditable). */
+body.webdoc-edit-on [data-md-svgtext] {
+  cursor: text;
+}
+
+body.webdoc-edit-on [data-md-svgtext]:hover {
+  text-decoration: underline dotted;
+}
+
+.webdoc-svg-input {
+  position: absolute;
+  z-index: 1002;
+  padding: 2px 6px;
+  border: 1px solid #0f766e;
+  border-radius: 5px;
+  background: #fff;
+  color: #1f2528;
+  font: 0.85rem/1.3 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  box-shadow: 0 6px 22px rgba(0, 0, 0, 0.18);
+}
+
+.webdoc-svg-input[hidden] {
+  display: none;
+}
+
 /* Per-block save status pill (saving / saved / error). */
 .webdoc-status {
   position: absolute;
@@ -416,6 +442,7 @@ body:not(.webdoc-edit-on) .webdoc-lint {
   .webdoc-edit-notice,
   .webdoc-toolbar,
   .webdoc-link-pop,
+  .webdoc-svg-input,
   .webdoc-status,
   .webdoc-toast,
   .webdoc-lint {
