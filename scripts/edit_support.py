@@ -297,6 +297,11 @@ def apply_edit(source_path: str | Path, payload: dict) -> tuple[int, dict]:
         target_type = str(payload.get("target", ""))
         if btype not in _RETYPE_TYPES or target_type not in _RETYPE_TYPES or target_type == btype:
             return 400, {"error": "bad_retype"}
+    elif op in ("split", "merge"):
+        # Split one paragraph into two, or merge two paragraphs into one - both
+        # are paragraph-only (a heading/list item has its own structural line).
+        if btype != "paragraph":
+            return 400, {"error": "bad_type"}
     elif btype not in ALL_TYPES:
         return 400, {"error": "bad_type"}
 
@@ -322,6 +327,10 @@ def apply_edit(source_path: str | Path, payload: dict) -> tuple[int, dict]:
         return _apply_rowdelete(source_path, lines, trailing_newline, payload, newline)
     if op == "coldelete":
         return _apply_coldelete(source_path, lines, trailing_newline, payload, newline)
+    if op == "split":
+        return _apply_split(source_path, lines, trailing_newline, payload, newline)
+    if op == "merge":
+        return _apply_merge(source_path, lines, trailing_newline, payload, newline)
 
     flat = flatten(html_to_markdown(str(payload.get("html", ""))))
 
@@ -769,6 +778,128 @@ def _apply_delist(
         "ok": True, "type": "paragraph", "new_html": inline_md(flat),
         "new_hash": new_hash, "new_start": new_start, "new_end": new_start,
         "line_delta": len(new_block) - len(original_slice), "lint": lint_block(flat),
+    }
+
+
+def _apply_split(
+    source_path: Path,
+    lines: list[str],
+    trailing_newline: bool,
+    payload: dict,
+    newline: str = "\n",
+) -> tuple[int, dict]:
+    """Split one paragraph into two at the caret.
+
+    The client sends the block's range + hash and the two HTML halves (before and
+    after the caret). Each is flattened to a line and written as `before` / blank /
+    `after`, so the live DOM and a rebuild both see two paragraphs. Both halves
+    must be non-empty (no empty blocks). Undo (label "split") merges them back."""
+    try:
+        start = int(payload["start"])
+        end = int(payload["end"])
+    except (KeyError, TypeError, ValueError):
+        return 400, {"error": "bad_range"}
+    if start < 1 or end < start or end > len(lines):
+        return 409, dict(_STALE)
+    original_slice = lines[start - 1:end]
+    if block_hash("\n".join(original_slice)) != str(payload.get("hash", "")):
+        return 409, dict(_STALE)
+
+    before = flatten(html_to_markdown(str(payload.get("before", ""))))
+    after = flatten(html_to_markdown(str(payload.get("after", ""))))
+    if not before or not after:
+        return 400, {"error": "empty_split",
+                     "message": "Both halves need text - place the caret between words to split."}
+
+    b = ("\\" + before) if _LEADING_BLOCK.match(before) else before
+    a = ("\\" + after) if _LEADING_BLOCK.match(after) else after
+    new_block = [b, "", a]
+    new_lines = lines[:start - 1] + new_block + lines[end:]
+    _write_lines(source_path, new_lines, trailing_newline, newline)
+
+    _push_undo(source_path, {
+        "label": "split", "at": start - 1, "remove": len(new_block),
+        "insert": original_slice, "expect": new_block,
+        "trailing": trailing_newline, "newline": newline,
+    })
+
+    after_start = start + 2
+    hash_before, hash_after = block_hash(b), block_hash(a)
+    for pos, digest, text in ((start, hash_before, before), (after_start, hash_after, after)):
+        append_ledger(source_path, {
+            "type": "paragraph", "start": pos, "end": pos,
+            "content_hash": digest, "edited_at": now_iso(), "excerpt": text[:120],
+        })
+    return 200, {
+        "ok": True, "op": "split",
+        "before": {"new_start": start, "new_end": start, "new_hash": hash_before,
+                   "new_html": inline_md(before), "lint": lint_block(before)},
+        "after": {"new_start": after_start, "new_end": after_start, "new_hash": hash_after,
+                  "new_html": inline_md(after), "lint": lint_block(after)},
+        "line_delta": len(new_block) - len(original_slice),
+    }
+
+
+def _apply_merge(
+    source_path: Path,
+    lines: list[str],
+    trailing_newline: bool,
+    payload: dict,
+    newline: str = "\n",
+) -> tuple[int, dict]:
+    """Merge a paragraph into the paragraph above it (Backspace at its start).
+
+    The client sends both blocks' range + hash and both halves' current HTML.
+    Their text joins with a space and the blank line(s) between is dropped. Only a
+    blank separator may sit between them. Undo (label "merge") splits back."""
+    try:
+        start = int(payload["start"])
+        end = int(payload["end"])
+        prev_start = int(payload["prev_start"])
+        prev_end = int(payload["prev_end"])
+    except (KeyError, TypeError, ValueError):
+        return 400, {"error": "bad_range"}
+    if (prev_start < 1 or prev_end < prev_start or start <= prev_end
+            or end < start or end > len(lines)):
+        return 409, dict(_STALE)
+    prev_slice = lines[prev_start - 1:prev_end]
+    this_slice = lines[start - 1:end]
+    if block_hash("\n".join(prev_slice)) != str(payload.get("prev_hash", "")):
+        return 409, dict(_STALE)
+    if block_hash("\n".join(this_slice)) != str(payload.get("hash", "")):
+        return 409, dict(_STALE)
+    # Only a blank-line separator may sit between them (two adjacent paragraphs).
+    if any(line.strip() for line in lines[prev_end:start - 1]):
+        return 409, dict(_STALE)
+
+    a_text = flatten(html_to_markdown(str(payload.get("prev_html", ""))))
+    b_text = flatten(html_to_markdown(str(payload.get("html", ""))))
+    joined = (a_text + " " + b_text).strip()
+    if not joined:
+        return 400, {"error": "empty_block",
+                     "message": "To remove a block, use the Delete button (a block can't be emptied)."}
+    merged = ("\\" + joined) if _LEADING_BLOCK.match(joined) else joined
+
+    span = lines[prev_start - 1:end]
+    new_lines = lines[:prev_start - 1] + [merged] + lines[end:]
+    _write_lines(source_path, new_lines, trailing_newline, newline)
+
+    _push_undo(source_path, {
+        "label": "merge", "at": prev_start - 1, "remove": 1,
+        "insert": span, "expect": [merged],
+        "trailing": trailing_newline, "newline": newline,
+    })
+
+    new_hash = block_hash(merged)
+    append_ledger(source_path, {
+        "type": "paragraph", "start": prev_start, "end": prev_start,
+        "content_hash": new_hash, "edited_at": now_iso(), "excerpt": joined[:120],
+    })
+    return 200, {
+        "ok": True, "op": "merge",
+        "new_start": prev_start, "new_end": prev_start, "new_hash": new_hash,
+        "new_html": inline_md(joined), "line_delta": 1 - len(span),
+        "lint": lint_block(joined),
     }
 
 

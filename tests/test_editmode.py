@@ -1239,6 +1239,88 @@ def _():
     eq(src.read_text(encoding="utf-8"), text, "unchanged throughout")
 
 
+# --------------------------------------------------------------------------- #
+# Paragraph split / merge (op="split" / "merge")
+# --------------------------------------------------------------------------- #
+
+@test("split: one paragraph becomes two, blank-separated; undo merges back")
+def _():
+    text = "One two three four.\n"
+    src = write_md(text)
+    status, body = edit_support.apply_edit(src, {
+        "op": "split", "type": "paragraph", "start": 1, "end": 1,
+        "hash": slice_hash(text, 1, 1), "before": "One two", "after": "three four."})
+    eq(status, 200, "status")
+    eq(src.read_text(encoding="utf-8"), "One two\n\nthree four.\n", "two paragraphs, blank between")
+    eq(body["before"]["new_start"], 1, "before half at line 1")
+    eq(body["after"]["new_start"], 3, "after half at line 3 (below the blank)")
+    eq(body["line_delta"], 2, "one line became three")
+    edit_support.apply_undo(src)
+    eq(src.read_text(encoding="utf-8"), text, "undo restores the single paragraph")
+
+
+@test("split: an empty half is rejected (no empty blocks); stale hash 409s")
+def _():
+    text = "Solo line.\n"
+    src = write_md(text)
+    st, bd = edit_support.apply_edit(src, {
+        "op": "split", "type": "paragraph", "start": 1, "end": 1,
+        "hash": slice_hash(text, 1, 1), "before": "Solo line.", "after": "   "})
+    eq(st, 400, "empty half rejected")
+    eq(bd["error"], "empty_split", "error")
+    st2 = edit_support.apply_edit(src, {
+        "op": "split", "type": "paragraph", "start": 1, "end": 1,
+        "hash": "bad", "before": "a", "after": "b"})[0]
+    eq(st2, 409, "stale hash")
+    eq(src.read_text(encoding="utf-8"), text, "unchanged throughout")
+
+
+@test("merge: a paragraph joins the one above; undo splits back")
+def _():
+    text = "A para.\n\nB para.\n"
+    src = write_md(text)
+    status, body = edit_support.apply_edit(src, {
+        "op": "merge", "type": "paragraph",
+        "start": 3, "end": 3, "hash": slice_hash(text, 3, 3),
+        "prev_start": 1, "prev_end": 1, "prev_hash": slice_hash(text, 1, 1),
+        "prev_html": "A para.", "html": "B para."})
+    eq(status, 200, "status")
+    eq(src.read_text(encoding="utf-8"), "A para. B para.\n", "joined with a space, blank dropped")
+    eq(body["line_delta"], -2, "three lines became one")
+    edit_support.apply_undo(src)
+    eq(src.read_text(encoding="utf-8"), text, "undo restores both paragraphs byte-identical")
+
+
+@test("merge: rejects when a non-blank line sits between the paragraphs")
+def _():
+    text = "A para.\n\n## Heading\n\nB para.\n"
+    src = write_md(text)
+    st = edit_support.apply_edit(src, {
+        "op": "merge", "type": "paragraph",
+        "start": 5, "end": 5, "hash": slice_hash(text, 5, 5),
+        "prev_start": 1, "prev_end": 1, "prev_hash": slice_hash(text, 1, 1),
+        "prev_html": "A para.", "html": "B para."})[0]
+    eq(st, 409, "a heading between the paragraphs blocks the merge")
+    eq(src.read_text(encoding="utf-8"), text, "unchanged")
+
+
+@test("split then merge round-trips a paragraph")
+def _():
+    text = "Alpha beta gamma.\n"
+    src = write_md(text)
+    edit_support.apply_edit(src, {
+        "op": "split", "type": "paragraph", "start": 1, "end": 1,
+        "hash": slice_hash(text, 1, 1), "before": "Alpha beta", "after": "gamma."})
+    eq(src.read_text(encoding="utf-8"), "Alpha beta\n\ngamma.\n", "split")
+    now = src.read_text(encoding="utf-8")
+    edit_support.apply_edit(src, {
+        "op": "merge", "type": "paragraph",
+        "start": 3, "end": 3, "hash": slice_hash(now, 3, 3),
+        "prev_start": 1, "prev_end": 1, "prev_hash": slice_hash(now, 1, 1),
+        "prev_html": "Alpha beta", "html": "gamma."})
+    eq(src.read_text(encoding="utf-8"), "Alpha beta gamma.\n", "merge restores the joined text")
+
+
 def main() -> int:
     print(f"editmode test suite  ({len(TESTS)} tests)")
     print(f"  modules: {SCRIPTS}")

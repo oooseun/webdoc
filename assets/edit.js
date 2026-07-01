@@ -378,8 +378,7 @@
     var start = parseInt(target.dataset.mdStart, 10);
     var end = parseInt(target.dataset.mdEnd, 10);
     var prevEdited = target.hasAttribute("data-webdoc-edited");
-    var parent = target.parentNode;
-    var nextSibling = target.nextSibling;
+    var parent = target.parentNode;  // nextSibling captured after the lint node is removed
 
     setStatus(target, "saving", "deleting…");
     pendingSaves++;
@@ -411,6 +410,7 @@
       // then drop the node from the page but keep the reference for undo.
       if (target.__wdStatus) { target.__wdStatus.remove(); target.__wdStatus = null; }
       if (target.__wdLint) { target.__wdLint.remove(); target.__wdLint = null; }
+      var nextSibling = target.nextSibling;  // after lint removal -> true following node
       if (parent) parent.removeChild(target);
       shiftFollowing(end, res.body.line_delta || 0, null);
       pushUndo({
@@ -439,6 +439,38 @@
     probe.selectNodeContents(block);
     probe.setEnd(r.startContainer, r.startOffset);
     return probe.toString().length === 0;
+  }
+
+  // True when the caret is collapsed at the very end of the block (no text after
+  // it), so Enter there would only create an empty second paragraph.
+  function caretAtEnd(block) {
+    var sel = window.getSelection();
+    if (!sel || !sel.isCollapsed || !sel.rangeCount) return false;
+    var r = sel.getRangeAt(0);
+    if (!block.contains(r.endContainer)) return false;
+    var probe = document.createRange();
+    probe.selectNodeContents(block);
+    probe.setStart(r.endContainer, r.endOffset);
+    return probe.toString().length === 0;
+  }
+
+  // Activate `block` and drop the caret `offset` characters into its text (0 =
+  // start). Used after a split/merge so the caret lands where the user expects.
+  function focusOffset(block, offset) {
+    activate(block);
+    var walker = document.createTreeWalker(block, NodeFilter.SHOW_TEXT, null);
+    var remaining = offset, node, target = null, at = 0;
+    while ((node = walker.nextNode())) {
+      if (remaining <= node.length) { target = node; at = remaining; break; }
+      remaining -= node.length;
+    }
+    var r = document.createRange();
+    if (target) r.setStart(target, at);
+    else { r.selectNodeContents(block); r.collapse(false); } // fall back to the end
+    r.collapse(true);
+    var sel = window.getSelection();
+    sel.removeAllRanges();
+    sel.addRange(r);
   }
 
   // A gap element identical to what create_site emits for an extra blank line,
@@ -489,6 +521,153 @@
       setStatus(block, "saved", dir === "add" ? "space added" : "space removed");
     }).catch(function () {
       setStatus(block, "error", "couldn't change spacing (offline?)");
+    }).finally(function () {
+      pendingSaves--;
+    });
+  }
+
+  // -- paragraph split / merge (Enter mid-paragraph / Backspace at start) ---
+
+  // The nearest previous sibling that is an editable block, skipping decoration
+  // (lint hints, status pills) that render between blocks. Stops at a gap spacer
+  // and returns null - a gap means "keep the space", don't merge across it.
+  function previousBlock(node) {
+    var sib = node.previousElementSibling;
+    while (sib) {
+      if (sib.dataset && sib.dataset.mdType) return sib;
+      if (sib.classList && sib.classList.contains("webdoc-gap")) return null;
+      sib = sib.previousElementSibling;
+    }
+    return null;
+  }
+
+  // Split the active paragraph at the caret into two. The DOM is split locally
+  // (the content after the caret moves into a new <p>); on save both halves get
+  // their server identity. Undoable (merges the halves back).
+  function splitParagraph() {
+    var p = state.active;
+    if (!p || p.dataset.mdType !== "paragraph") return;
+    var sel = window.getSelection();
+    if (!sel || !sel.rangeCount) return;
+    var caret = sel.getRangeAt(0);
+    if (!p.contains(caret.endContainer)) return;
+
+    var prevHtml = p.innerHTML;                 // whole paragraph, for undo
+    var tail = document.createRange();
+    tail.selectNodeContents(p);
+    tail.setStart(caret.endContainer, caret.endOffset);
+    var q = el("p");
+    q.appendChild(tail.extractContents());      // p now holds "before", q "after"
+    if (!p.textContent.trim() || !q.textContent.trim()) {
+      p.innerHTML = prevHtml;                    // an edge caret -> nothing to split
+      return;
+    }
+    var beforeHtml = p.innerHTML.trim();
+    var afterHtml = q.innerHTML.trim();
+    var start = parseInt(p.dataset.mdStart, 10);
+    var oldEnd = parseInt(p.dataset.mdEnd, 10);
+    // Insert q now but WITHOUT identity, so shiftFollowing skips it on save.
+    p.parentNode.insertBefore(q, p.nextSibling);
+    state.active = null;
+    deactivate(p);
+    pendingSaves++;
+    setStatus(p, "saving", "splitting…");
+
+    function restore() { if (q.parentNode) q.parentNode.removeChild(q); p.innerHTML = prevHtml; }
+    fetch("/api/edit", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        op: "split", type: "paragraph", start: start, end: oldEnd,
+        hash: p.dataset.mdHash, before: beforeHtml, after: afterHtml
+      })
+    }).then(function (resp) {
+      return resp.json().catch(function () { return {}; }).then(function (body) {
+        return { status: resp.status, ok: resp.ok, body: body };
+      });
+    }).then(function (res) {
+      if (res.status === 409) { restore(); onConflict(p, res.body); return; }
+      if (!res.ok || !res.body || !res.body.ok) {
+        restore();
+        if (res.status === 403 && res.body && res.body.error === "loopback_only") showLanNotice();
+        else setStatus(p, "error", friendlyError(res.body));
+        return;
+      }
+      if (p.__wdStatus) { p.__wdStatus.remove(); p.__wdStatus = null; }
+      if (p.__wdLint) { p.__wdLint.remove(); p.__wdLint = null; }
+      shiftFollowing(oldEnd, res.body.line_delta || 0, p); // q has no identity yet
+      setBlockAttrs(p, "paragraph", res.body.before);
+      setBlockAttrs(q, "paragraph", res.body.after);
+      p.innerHTML = res.body.before.new_html;
+      q.innerHTML = res.body.after.new_html;
+      p.setAttribute("data-webdoc-edited", "1");
+      q.setAttribute("data-webdoc-edited", "1");
+      renderLint(p, res.body.before.lint || []);
+      renderLint(q, res.body.after.lint || []);
+      pushUndo({ label: "split", before: p, after: q, prevHtml: prevHtml });
+      setStatus(q, "saved", "split");
+      updateCount();
+      focusOffset(q, 0);                          // caret at the start of the 2nd half
+    }).catch(function () {
+      restore();
+      setStatus(p, "error", "couldn't split (offline?)");
+    }).finally(function () {
+      pendingSaves--;
+    });
+  }
+
+  // Merge the active paragraph into the paragraph above it. Their text joins with
+  // a space; the blank line between is dropped. Undoable (splits them back).
+  function mergeParagraph(block, prev) {
+    var joinAt = prev.textContent.length + 1;   // caret lands after "A " in "A B"
+    var prevHtmlA = prev.innerHTML;
+    var aAttrs = {
+      new_start: prev.dataset.mdStart, new_end: prev.dataset.mdEnd, new_hash: prev.dataset.mdHash
+    };
+    var parent = block.parentNode;   // nextSibling is captured after the lint node
+    var oldEnd = parseInt(block.dataset.mdEnd, 10); // is removed, so undo re-inserts correctly
+    state.active = null;
+    deactivate(block);
+    pendingSaves++;
+    setStatus(prev, "saving", "merging…");
+    fetch("/api/edit", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        op: "merge", type: "paragraph",
+        start: parseInt(block.dataset.mdStart, 10), end: parseInt(block.dataset.mdEnd, 10),
+        hash: block.dataset.mdHash,
+        prev_start: parseInt(prev.dataset.mdStart, 10), prev_end: parseInt(prev.dataset.mdEnd, 10),
+        prev_hash: prev.dataset.mdHash,
+        prev_html: prevHtmlA, html: block.innerHTML
+      })
+    }).then(function (resp) {
+      return resp.json().catch(function () { return {}; }).then(function (body) {
+        return { status: resp.status, ok: resp.ok, body: body };
+      });
+    }).then(function (res) {
+      if (res.status === 409) { onConflict(block, res.body); return; }
+      if (!res.ok || !res.body || !res.body.ok) {
+        if (res.status === 403 && res.body && res.body.error === "loopback_only") showLanNotice();
+        else setStatus(block, "error", friendlyError(res.body));
+        return;
+      }
+      if (block.__wdStatus) { block.__wdStatus.remove(); block.__wdStatus = null; }
+      if (block.__wdLint) { block.__wdLint.remove(); block.__wdLint = null; }
+      var nextSibling = block.nextSibling;  // the true following node, past any lint
+      if (parent) parent.removeChild(block);
+      setBlockAttrs(prev, "paragraph", res.body);
+      prev.innerHTML = res.body.new_html;
+      shiftFollowing(oldEnd, res.body.line_delta || 0, prev);
+      prev.setAttribute("data-webdoc-edited", "1");
+      renderLint(prev, res.body.lint || []);      // the joined text may lint differently
+      pushUndo({
+        label: "merge", prev: prev, removed: block, parent: parent, nextSibling: nextSibling,
+        prevHtmlA: prevHtmlA, aAttrs: aAttrs
+      });
+      setStatus(prev, "saved", "merged");
+      updateCount();
+      focusOffset(prev, joinAt);
+    }).catch(function () {
+      setStatus(block, "error", "couldn't merge (offline?)");
     }).finally(function () {
       pendingSaves--;
     });
@@ -1277,7 +1456,8 @@
     if (body.label !== entry.label) return false;
     if (entry.label === "cell") return body.line === entry.line && body.cell === entry.cell;
     if (entry.label === "space" || entry.label === "svgtext" ||
-        entry.label === "rowdelete" || entry.label === "coldelete") return true; // splice-level
+        entry.label === "rowdelete" || entry.label === "coldelete" ||
+        entry.label === "split" || entry.label === "merge") return true; // splice-level
     return body.new_start === entry.expectStart; // edit + delete + retype
   }
 
@@ -1326,6 +1506,35 @@
       updateCount();
       return;
     }
+    if (entry.label === "split") {
+      // Merge the halves back: drop the 2nd <p> (and its lint), restore the 1st to
+      // the whole paragraph, and re-shift the following blocks up.
+      if (entry.after) {
+        if (entry.after.__wdLint) { entry.after.__wdLint.remove(); entry.after.__wdLint = null; }
+        if (entry.after.parentNode) entry.after.parentNode.removeChild(entry.after);
+      }
+      entry.before.innerHTML = entry.prevHtml;
+      setRangeAttrs(entry.before, body);
+      renderLint(entry.before, []);            // stale split-half lint no longer applies
+      shiftFollowing(body.shift_threshold, body.line_delta || 0, entry.before);
+      setStatus(entry.before, "saved", "undone");
+      updateCount();
+      return;
+    }
+    if (entry.label === "merge") {
+      // Split back: push the following blocks down first (while the 2nd <p> is out
+      // of the DOM), restore the 1st paragraph, then re-insert the 2nd where it sat.
+      shiftFollowing(body.shift_threshold, body.line_delta || 0, null);
+      entry.prev.innerHTML = entry.prevHtmlA;
+      entry.prev.dataset.mdStart = entry.aAttrs.new_start;
+      entry.prev.dataset.mdEnd = entry.aAttrs.new_end;
+      entry.prev.dataset.mdHash = entry.aAttrs.new_hash;
+      renderLint(entry.prev, []);              // drop the merge's lint on the reverted paragraph
+      if (entry.parent) entry.parent.insertBefore(entry.removed, entry.nextSibling || null);
+      setStatus(entry.prev, "saved", "undone");
+      updateCount();
+      return;
+    }
     if (entry.label === "retype") {
       // Reverse the element swap: restore the original block, drop the new one.
       if (entry.newNode.tagName === "LI") unswapListItem(entry.reverse);
@@ -1351,6 +1560,9 @@
     } else { // edit
       node.innerHTML = entry.prevHTML;
       setRangeAttrs(node, body);
+      // The stale hint is from the pre-undo text; the server undo carries no lint,
+      // so clear it (it recomputes on the next edit) - matching split/merge undo.
+      renderLint(node, body.lint || []);
       shiftFollowing(body.shift_threshold, body.line_delta || 0, node);
     }
     restoreEdited(node, entry.prevEdited);
@@ -1445,15 +1657,20 @@
       return;
     }
     if (!state.active) return;
-    // Spacing: at a paragraph/heading's very start, Enter adds a gap above it,
-    // and Backspace removes one (when a gap is there) instead of doing nothing
-    // across the contenteditable boundary. List items are excluded - a blank line
-    // would split the list. Anywhere else, Enter/Backspace behave normally.
-    var spaceable = state.active.dataset.mdType === "paragraph" ||
-                    state.active.dataset.mdType === "heading";
-    if (spaceable && ev.key === "Enter" && !mod && caretAtStart(state.active)) {
-      ev.preventDefault();
-      changeSpace(state.active, "add");
+    // Enter/Backspace on a paragraph or heading. At the very start, Enter adds a
+    // gap above and Backspace removes one (or, with no gap, merges into the
+    // paragraph above). Inside a paragraph, Enter splits it in two. A heading
+    // stays one line; list items are excluded (a blank line would split the list).
+    var atype = state.active.dataset.mdType;
+    var spaceable = atype === "paragraph" || atype === "heading";
+    if (spaceable && ev.key === "Enter" && !mod) {
+      if (caretAtStart(state.active)) {          // start -> gap above
+        ev.preventDefault();
+        changeSpace(state.active, "add");
+        return;
+      }
+      ev.preventDefault();                       // never leave a stray line break
+      if (atype === "paragraph" && !caretAtEnd(state.active)) splitParagraph();
       return;
     }
     if (spaceable && ev.key === "Backspace" && !mod && caretAtStart(state.active)) {
@@ -1462,6 +1679,14 @@
         ev.preventDefault();
         changeSpace(state.active, "remove");
         return;
+      }
+      if (atype === "paragraph") {               // no gap above -> merge into the
+        var prevPara = previousBlock(state.active); // paragraph above (past any lint hint)
+        if (prevPara && prevPara.dataset.mdType === "paragraph") {
+          ev.preventDefault();
+          mergeParagraph(state.active, prevPara);
+          return;
+        }
       }
     }
     if (ev.key === "Escape") {
