@@ -43,6 +43,11 @@ _FENCE_CLOSE = re.compile(r"^ {0,3}(`{3,}|~{3,})[ \t]*$")
 # Markdown list-item line: "- x", "* x", "+ x", "1. x", "2) x".
 _LIST_MARKER = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+")
 
+# A structurally single-line block: an ATX heading or a list item. These stay
+# their own block even inside a run of consecutive non-blank lines, so their
+# single-line hash is credited; a plain paragraph line's is not.
+_HEADING_OR_LIST = re.compile(r"^\s*(?:#{1,6}\s|[-*+]\s|\d+[.)]\s)")
+
 # Abbreviations whose trailing period must not split a sentence. The dotted
 # acronym pattern covers e.g./i.e./U.S./a.m. (single letters each + dot).
 _DOTTED_ACRONYM = re.compile(r"\b(?:[A-Za-z]\.){2,}")
@@ -199,6 +204,77 @@ def paragraphs(lines: list[tuple[int, str]]) -> list[list[tuple[int, str]]]:
     return paras
 
 
+def human_authored_hashes(source_path: Path) -> set[str]:
+    """Content hashes of blocks a human edited in the in-page editor, read from
+    the sidecar ledger `<stem>.edits.json`. Empty when there is no ledger, so a
+    doc that was never opened in the editor lints exactly as before.
+
+    Trust model: the ledger is a plain local sidecar written by the loopback
+    editor; it is trusted, not authenticated. It downgrades ACCIDENTAL AI slop in
+    never-opened docs, not a motivated author who could write the ledger directly.
+    The gate stays fail-safe: any unreadable/malformed ledger yields an empty set
+    (lint everything), never a silent pass. Table-cell edits aren't covered yet -
+    their ledger hash is a single cell field, which the line-based matcher can't
+    see, so a tell on an edited table row still gates (fail-safe)."""
+    ledger = Path(source_path).with_name(Path(source_path).stem + ".edits.json")
+    try:
+        data = json.loads(ledger.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError, ValueError):
+        return set()
+    if not isinstance(data, list):
+        return set()
+    return {
+        e["content_hash"] for e in data
+        if isinstance(e, dict) and isinstance(e.get("content_hash"), str)
+    }
+
+
+def _block_hash(text: str) -> str | None:
+    """create_site's block hash, imported lazily so the linter still runs (just
+    without human-edit awareness) if create_site is somehow unavailable."""
+    try:
+        from create_site import block_hash
+    except Exception:
+        return None
+    return block_hash(text)
+
+
+def block_is_human_authored(md_lines: list[str], lineno: int, human: set[str]) -> bool:
+    """True if the source block containing 1-based `lineno` matches a human-edited
+    block hash.
+
+    The block is the maximal run of non-blank lines around `lineno`: the editor
+    flattens an edited paragraph to a single line, so a real edit's run is one
+    line, while an un-edited hard-wrapped paragraph is the whole run. Matching the
+    WHOLE-run hash (not a bare physical line) stops a tell inside an un-edited
+    multi-line paragraph from borrowing another block's identical-text exemption.
+    A heading or list item is additionally credited by its single line, since it
+    stays its own block inside a run of consecutive items - but a plain paragraph
+    line is not. Hash-keyed, so it holds under line drift and lapses the moment the
+    block's text changes (a later edit or AI rewrite gets a new hash, re-linted)."""
+    if not human:
+        return False
+    idx = lineno - 1
+    if idx < 0 or idx >= len(md_lines):
+        return False
+    lo = idx
+    while lo > 0 and md_lines[lo - 1].strip():
+        lo -= 1
+    hi = idx
+    while hi + 1 < len(md_lines) and md_lines[hi + 1].strip():
+        hi += 1
+    run = _block_hash("\n".join(md_lines[lo:hi + 1]))
+    if run is None:
+        return False  # create_site unavailable -> no downgrade, lint everything
+    if run in human:
+        return True
+    if _HEADING_OR_LIST.match(md_lines[idx]):
+        single = _block_hash(md_lines[idx])
+        if single is not None and single in human:
+            return True
+    return False
+
+
 def load_rules() -> list[dict]:
     """Load and shallow-validate rules.json. Raises ConfigError on any problem."""
     try:
@@ -331,6 +407,8 @@ def main() -> int:
     ap.add_argument("source", type=Path, help="Markdown file to lint")
     ap.add_argument("--no-lint", action="store_true", help="skip the gate entirely (escape hatch)")
     ap.add_argument("--warn-only", action="store_true", help="report findings but always exit 0")
+    ap.add_argument("--ignore-ledger", action="store_true",
+                    help="lint every block, even ones a human edited in the in-page editor")
     ap.add_argument("--json", action="store_true", help="emit findings as JSON on stdout")
     args = ap.parse_args()
 
@@ -350,25 +428,46 @@ def main() -> int:
         print(f"lint_prose: config error: {e}", file=sys.stderr)
         return 2
 
-    errors = [a for a in alerts if a[1] == "error"]
-    advisory = [a for a in alerts if a[1] != "error"]
+    # Downgrade findings on blocks a human edited in the in-page editor: that
+    # content is human-authored, not AI-generated, so it should not gate a build.
+    # Hash-keyed via the sidecar ledger, so the exemption never leaks to a later
+    # AI rewrite of the same block (its hash changes) and holds under line drift.
+    md_lines = md.splitlines()
+    human = set() if args.ignore_ledger else human_authored_hashes(src)
+    tagged = [
+        (line, sev, rule, msg, block_is_human_authored(md_lines, line, human))
+        for line, sev, rule, msg in alerts
+    ]
+    # An error on a human-edited block becomes advisory (printed, but not gated).
+    gating = [t for t in tagged if t[1] == "error" and not t[4]]
+    n_human = sum(1 for t in tagged if t[4] and t[1] == "error")
 
     if args.json:
         # JSON consumers get faithful data; json.dumps escapes control chars.
         print(json.dumps(
-            [{"line": l, "severity": s, "rule": r, "message": m} for l, s, r, m in alerts],
+            [{"line": l, "severity": s, "rule": r, "message": m,
+              "human_edited": h, "gated": (s == "error" and not h)}
+             for l, s, r, m, h in tagged],
             indent=2,
         ))
     else:
-        for line, sev, rule, message in alerts:
+        for line, sev, rule, message, human_edited in tagged:
+            downgraded = human_edited and sev == "error"
+            label = "ADVISORY" if downgraded else sev.upper()
+            note = "  (human-edited)" if downgraded else ""
             # Strip control chars so a crafted snippet can't drive the terminal.
-            print(f"  {sev.upper():10} L{line:>4}  {rule}: {_strip_control(message)}", file=sys.stderr)
-        print(
-            f"prose lint: {len(errors)} error(s), {len(advisory)} advisory  ({src.name})",
-            file=sys.stderr,
-        )
+            print(f"  {label:10} L{line:>4}  {rule}: {_strip_control(message)}{note}", file=sys.stderr)
+        summary = f"prose lint: {len(gating)} error(s), {len(tagged) - len(gating)} advisory"
+        if n_human:
+            summary += f" (incl. {n_human} error tell(s) downgraded as human-edited)"
+        print(f"{summary}  ({src.name})", file=sys.stderr)
+        # If every error tell was downgraded, the gate passed ONLY because of the
+        # ledger - say so loudly so a fully-suppressed gate is never silent.
+        if n_human and not gating:
+            print(f"  note: prose gate passed only via the ledger - all {n_human} "
+                  f"error tell(s) are on human-edited blocks; none gated.", file=sys.stderr)
 
-    if errors and not args.warn_only:
+    if gating and not args.warn_only:
         return 1
     return 0
 

@@ -40,6 +40,9 @@ from pathlib import Path
 DEFAULT_LINTER = str(Path(__file__).resolve().parents[1] / "scripts" / "lint_prose.py")
 LINTER = os.environ.get("LINT_PROSE", DEFAULT_LINTER)
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+from create_site import block_hash  # noqa: E402  (build ledger fixtures with the real hash)
+
 
 # --------------------------------------------------------------------------- #
 # CLI drivers - the only way these tests touch the linter
@@ -89,6 +92,29 @@ def run_exit(md: str, *extra: str) -> int:
     finally:
         os.unlink(path)
     return proc.returncode
+
+
+def run_with_ledger(md: str, edited: list[str], *extra: str) -> tuple[int, list[dict]]:
+    """Write `md` plus a sidecar ledger (`<stem>.edits.json`) marking each string
+    in `edited` as a human-edited block by its content hash, then lint. Returns
+    (exit_code, parsed --json findings)."""
+    path = _write_tmp(md)
+    p = Path(path)
+    ledger = p.with_name(p.stem + ".edits.json")
+    ledger.write_text(json.dumps([
+        {"type": "paragraph", "start": 1, "end": 1, "content_hash": block_hash(blk),
+         "edited_at": "2026-07-01T00:00:00Z", "excerpt": blk[:40]}
+        for blk in edited
+    ]), encoding="utf-8")
+    try:
+        rc = subprocess.run([sys.executable, LINTER, path, *extra],
+                            capture_output=True, text=True).returncode
+        out = subprocess.run([sys.executable, LINTER, path, "--json", *extra],
+                             capture_output=True, text=True).stdout
+    finally:
+        os.unlink(path)
+        ledger.unlink()
+    return rc, json.loads(out)
 
 
 # --------------------------------------------------------------------------- #
@@ -401,6 +427,74 @@ def _():
 def _():
     rc = run_exit(ERROR_DOC, "--no-lint")
     assert rc == 0, f"--no-lint should exit 0, got {rc}"
+
+
+# ---- ledger-aware downgrade (human-edited blocks) ------------------------- #
+
+@test("ledger: an error tell on a human-edited block is downgraded, not gated")
+def _():
+    block = f"This release is great {EM} really."
+    rc, alerts = run_with_ledger(block + "\n", [block])
+    em = [a for a in alerts if a["rule"] == "em-dash"]
+    assert em, f"em-dash should still fire (as advisory): {alerts}"
+    assert em[0]["severity"] == "error" and em[0]["human_edited"] and not em[0]["gated"], em
+    assert rc == 0, f"a human-edited error tell must not gate, got {rc}"
+
+
+@test("ledger: the same tell still gates when its block is NOT in the ledger")
+def _():
+    block = f"This release is great {EM} really."
+    rc, _ = run_with_ledger(block + "\n", ["an unrelated block the human edited"])
+    assert rc == 1, "an un-edited block's error tell still gates the build"
+
+
+@test("ledger: a changed block re-gates (hash-keyed exemption lapses on edit)")
+def _():
+    # ledger records the old text; the doc now has different words -> hash miss.
+    rc, alerts = run_with_ledger(f"This shipment is superb {EM} truly.\n",
+                                 [f"This release is great {EM} really."])
+    em = [a for a in alerts if a["rule"] == "em-dash"]
+    assert em and em[0]["gated"] and not em[0]["human_edited"], em
+    assert rc == 1, "the exemption must not survive a text change"
+
+
+@test("ledger: --ignore-ledger lints human-edited blocks too")
+def _():
+    block = f"This release is great {EM} really."
+    rc, _ = run_with_ledger(block + "\n", [block], "--ignore-ledger")
+    assert rc == 1, "--ignore-ledger gates even a human-edited block"
+
+
+@test("ledger: a multi-line human-edited paragraph is recognized")
+def _():
+    para = f"First line stays clean here.\nSecond line has a dash {EM} yes."
+    rc, alerts = run_with_ledger(para + "\n", [para])
+    em = [a for a in alerts if a["rule"] == "em-dash"]
+    assert em and em[0]["human_edited"] and not em[0]["gated"], em
+    assert rc == 0, "an error on any line of a human-edited paragraph is downgraded"
+
+
+@test("ledger: a tell inside an un-edited multi-line paragraph is NOT downgraded (no leak)")
+def _():
+    # An un-edited hard-wrapped paragraph (lines 1-3, em dash on line 2) and a
+    # separate one-line human-edited paragraph (line 5) with text identical to
+    # line 2. The wrapped paragraph's line must NOT borrow the one-liner's hash.
+    dash = f"a shared dash {EM} here"
+    doc = f"top wrapped line\n{dash}\nbottom wrapped line\n\n{dash}\n"
+    rc, alerts = run_with_ledger(doc, [dash])  # ledger holds only the line-5 block
+    ems = {a["line"]: a for a in alerts if a["rule"] == "em-dash"}
+    assert ems[2]["gated"] and not ems[2]["human_edited"], f"line 2 (wrapped para) must gate: {alerts}"
+    assert ems[5]["human_edited"] and not ems[5]["gated"], f"line 5 (edited one-liner) downgraded: {alerts}"
+    assert rc == 1, "the un-edited wrapped paragraph's em dash still gates the build"
+
+
+@test("ledger: a human-edited list item is recognized by its single line")
+def _():
+    doc = f"- first item is fine\n- second item has a dash {EM} yes\n- third item\n"
+    rc, alerts = run_with_ledger(doc, [f"- second item has a dash {EM} yes"])
+    em = [a for a in alerts if a["rule"] == "em-dash"]
+    assert em and em[0]["human_edited"] and not em[0]["gated"], em
+    assert rc == 0, "an edited list item's tell is downgraded via its single-line hash"
 
 
 @test("gate: missing source file exits 2")
