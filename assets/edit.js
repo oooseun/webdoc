@@ -56,6 +56,16 @@
     return node;
   }
 
+  // Shared response unwrap for every API call. Also the one place the server's
+  // post-rebuild site_version is adopted, so this tab's own saves never trip
+  // its live-reload poll (see the live-reload section).
+  function readJson(resp) {
+    return resp.json().catch(function () { return {}; }).then(function (body) {
+      if (body && body.site_version) liveVersion = String(body.site_version);
+      return { status: resp.status, ok: resp.ok, body: body };
+    });
+  }
+
   function isEditable(node) {
     return node && node.nodeType === 1 && node.matches(EDITABLE) && !node.hasAttribute("data-noedit");
   }
@@ -122,8 +132,9 @@
       toggleBtn.title = "Editing runs only on the host machine (open via 127.0.0.1)";
     }
     toggleBtn.addEventListener("click", function () {
-      if (state.on) exitEditMode();
-      else enterEditMode();
+      if (state.on) { exitEditMode(); return; }
+      exitAnnotate(); // the two modes are mutually exclusive
+      enterEditMode();
     });
     document.body.appendChild(toggleBtn);
   }
@@ -389,9 +400,7 @@
         op: "delete", type: type, start: start, end: end, hash: target.dataset.mdHash
       })
     }).then(function (resp) {
-      return resp.json().catch(function () { return {}; }).then(function (body) {
-        return { status: resp.status, ok: resp.ok, body: body };
-      });
+      return readJson(resp);
     }).then(function (res) {
       if (res.status === 409) {
         onConflict(target, res.body); // block changed on disk; keep it, flag it
@@ -498,9 +507,7 @@
         hash: block.dataset.mdHash, dir: dir
       })
     }).then(function (resp) {
-      return resp.json().catch(function () { return {}; }).then(function (body) {
-        return { status: resp.status, ok: resp.ok, body: body };
-      });
+      return readJson(resp);
     }).then(function (res) {
       if (res.status === 409) { onConflict(block, res.body); return; }
       if (!res.ok || !res.body || !res.body.ok) {
@@ -581,9 +588,7 @@
         hash: p.dataset.mdHash, before: beforeHtml, after: afterHtml
       })
     }).then(function (resp) {
-      return resp.json().catch(function () { return {}; }).then(function (body) {
-        return { status: resp.status, ok: resp.ok, body: body };
-      });
+      return readJson(resp);
     }).then(function (res) {
       if (res.status === 409) { restore(); onConflict(p, res.body); return; }
       if (!res.ok || !res.body || !res.body.ok) {
@@ -640,9 +645,7 @@
         prev_html: prevHtmlA, html: block.innerHTML
       })
     }).then(function (resp) {
-      return resp.json().catch(function () { return {}; }).then(function (body) {
-        return { status: resp.status, ok: resp.ok, body: body };
-      });
+      return readJson(resp);
     }).then(function (res) {
       if (res.status === 409) { onConflict(block, res.body); return; }
       if (!res.ok || !res.body || !res.body.ok) {
@@ -708,9 +711,7 @@
         start: start, end: oldEnd, hash: block.dataset.mdHash, html: htmlNow
       })
     }).then(function (resp) {
-      return resp.json().catch(function () { return {}; }).then(function (body) {
-        return { status: resp.status, ok: resp.ok, body: body };
-      });
+      return readJson(resp);
     }).then(function (res) {
       if (res.status === 409) { onConflict(block, res.body); return; }
       if (!res.ok || !res.body || !res.body.ok) {
@@ -838,9 +839,7 @@
       method: "POST", headers: { "content-type": "application/json" },
       body: JSON.stringify({ op: "rowdelete", line: line, cell: col, hash: hash })
     }).then(function (resp) {
-      return resp.json().catch(function () { return {}; }).then(function (body) {
-        return { status: resp.status, ok: resp.ok, body: body };
-      });
+      return readJson(resp);
     }).then(function (res) {
       if (res.status === 409) { onConflict(cell, res.body); return; }
       if (!res.ok || !res.body || !res.body.ok) {
@@ -889,9 +888,7 @@
         col: col, line: line, cell: col, hash: hash
       })
     }).then(function (resp) {
-      return resp.json().catch(function () { return {}; }).then(function (body) {
-        return { status: resp.status, ok: resp.ok, body: body };
-      });
+      return readJson(resp);
     }).then(function (res) {
       if (res.status === 409) { onConflict(cell, res.body); return; }
       if (!res.ok || !res.body || !res.body.ok) {
@@ -1014,9 +1011,7 @@
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ op: "svgtext", loc: loc, hash: oldHash, text: newText })
     }).then(function (resp) {
-      return resp.json().catch(function () { return {}; }).then(function (body) {
-        return { status: resp.status, ok: resp.ok, body: body };
-      });
+      return readJson(resp);
     }).then(function (res) {
       if (res.status === 409) { flash("Diagram changed on disk — reload to edit."); return; }
       if (!res.ok || !res.body || !res.body.ok) {
@@ -1295,9 +1290,7 @@
       headers: { "content-type": "application/json" },
       body: JSON.stringify(payload)
     }).then(function (resp) {
-      return resp.json().catch(function () { return {}; }).then(function (body) {
-        return { status: resp.status, ok: resp.ok, body: body };
-      });
+      return readJson(resp);
     }).then(function (res) {
       if (res.status === 409) {
         // The source drifted under the tab; keep what the user typed visible
@@ -1426,9 +1419,7 @@
       headers: { "content-type": "application/json" },
       body: "{}"
     }).then(function (resp) {
-      return resp.json().catch(function () { return {}; }).then(function (body) {
-        return { status: resp.status, ok: resp.ok, body: body };
-      });
+      return readJson(resp);
     }).then(function (res) {
       if (!res.ok || !res.body || !res.body.ok) {
         undoStack.length = 0;
@@ -1710,14 +1701,377 @@
     if (state.on && state.active) showToolbar(state.active);
   }
 
+  // ---- live reload ----------------------------------------------------------
+  // The server rebuilds index.html after every save, and an agent may rewrite
+  // the source + rebuild at any time. Poll the site version (a cheap stat) and
+  // reload when it moves, preserving scroll + mode. This tab's own saves are
+  // excluded because readJson() adopts the post-rebuild site_version.
+
+  var LIVE_POLL_MS = 2000;
+  var RELOAD_KEY = "webdoc:reload:" + location.pathname;
+  var RELOADED_TO_KEY = "webdoc:reloaded-to:" + location.pathname;
+  var liveVersion = null;   // ("var" hoists: readJson above assigns this too)
+  var liveCandidate = null; // a new version awaiting its second sighting
+  var lastReloadedTo = null; // loop breaker: the version the last reload chased
+  try { lastReloadedTo = sessionStorage.getItem(RELOADED_TO_KEY); } catch (e) { /* none */ }
+
+  // Never reload out from under in-progress work: an active block, an in-flight
+  // save/undo, the SVG label editor, an open annotation card, or any focused
+  // text field (the feedback form). The reload waits for the next idle poll.
+  function editorBusy() {
+    if (state.active || pendingSaves > 0 || undoing || svgTarget || annCard) return true;
+    var ae = document.activeElement;
+    return !!(ae && (ae.tagName === "TEXTAREA" || ae.tagName === "INPUT" || ae.isContentEditable));
+  }
+
+  // Baseline = the version of the DOM this tab is actually showing (the
+  // render-time meta stamp), not whatever the first poll happens to read: a
+  // rebuild landing inside the first poll window must still trigger a reload.
+  function seedLiveVersion() {
+    var meta = document.querySelector('meta[name="webdoc-version"]');
+    if (meta && meta.content) liveVersion = String(meta.content);
+  }
+
+  function pollSiteVersion() {
+    fetch("/api/version").then(readJson).then(function (res) {
+      if (!res.ok || !res.body || !res.body.v) return;
+      var v = String(res.body.v);
+      if (liveVersion === null) { liveVersion = v; return; }
+      if (v === liveVersion) { liveCandidate = null; return; }
+      // Loop breaker: the last reload chased exactly this version and the page
+      // STILL reports a different one, so the two version sources disagree (a
+      // stale server, a meta-less rebuild). Adopt it; never reload-loop.
+      if (v === lastReloadedTo) { liveVersion = v; liveCandidate = null; return; }
+      // Require the SAME new version on two consecutive polls so a rebuild
+      // still being written is never loaded half-done.
+      if (liveCandidate !== v) { liveCandidate = v; return; }
+      if (editorBusy()) return; // keep the candidate; reload on the next idle poll
+      try {
+        sessionStorage.setItem(RELOAD_KEY, JSON.stringify({
+          x: window.scrollX, y: window.scrollY, edit: state.on, ann: annOn
+        }));
+        sessionStorage.setItem(RELOADED_TO_KEY, v);
+      } catch (e) { /* storage unavailable: reload without restore */ }
+      location.reload();
+    }).catch(function () { /* server gone (TTL) or transient: keep polling */ });
+  }
+
+  function restoreAfterReload() {
+    var raw = null;
+    try {
+      raw = sessionStorage.getItem(RELOAD_KEY);
+      if (raw) sessionStorage.removeItem(RELOAD_KEY);
+    } catch (e) { return; }
+    if (!raw) return;
+    var saved;
+    try { saved = JSON.parse(raw); } catch (e) { return; }
+    if (saved.edit) enterEditMode();
+    else if (saved.ann) enterAnnotate();
+    window.scrollTo(saved.x || 0, saved.y || 0);
+    // Once more after images/embeds settle, in case layout shifted.
+    window.addEventListener("load", function () {
+      window.scrollTo(saved.x || 0, saved.y || 0);
+    }, { once: true });
+  }
+
+  // ---- annotations (queued locally, sent as ONE batch when the reader says) --
+  // Reading mode's counterpart to editing: click a block, leave a comment. The
+  // queue lives in sessionStorage; NOTHING reaches the agent until "Send all",
+  // so annotating while reading never streams half-formed thoughts. Anchors are
+  // the block's data-md-* identity (hash-keyed, drift-proof, same as the ledger).
+
+  var annOn = false;
+  var annQueue = [];
+  var annToggleBtn = null;
+  var annPanel = null;   // fixed queue panel (list + send/discard)
+  var annCard = null;    // per-block comment card
+  var annSelection = null; // last non-collapsed selection {block, text}, see below
+  var ANN_KEY = "webdoc:annq:" + location.pathname;
+  var ANN_QUEUE_MAX = 100;   // matches the server's per-batch item cap
+  // Per-POST budget in BYTES (the server caps request bodies at 64KiB in bytes,
+  // and CJK/emoji content serializes at 3-4 bytes per character, so an item
+  // COUNT is the wrong unit). One worst-case item is ~8.5KiB, far under budget,
+  // so a one-item chunk always fits and the send always makes progress.
+  var ANN_CHUNK_BYTES = 48 * 1024;
+  var annSending = false;    // single-flight: a second Send coalesces into none
+
+  function annBodyBytes(items) {
+    var body = JSON.stringify({ kind: "annotations", items: items, page: location.pathname });
+    return window.TextEncoder ? new TextEncoder().encode(body).length
+                              : body.length * 3; // no TextEncoder: worst-case UTF-8 estimate
+  }
+
+  // The click that opens a comment card collapses any text selection before
+  // the card can read it (mousedown clears selections). Stash the last
+  // NON-collapsed selection as it happens; a collapse never clears the stash,
+  // and the card only uses it when it belongs to the clicked block.
+  function onSelectionChange() {
+    if (!annOn) return;
+    var sel = window.getSelection();
+    if (!sel || sel.isCollapsed || !sel.rangeCount) return;
+    var node = sel.getRangeAt(0).commonAncestorContainer;
+    var elNode = node.nodeType === 1 ? node : node.parentElement;
+    var block = elNode && elNode.closest ? elNode.closest(EDITABLE) : null;
+    if (!block || block.hasAttribute("data-noedit")) return;
+    annSelection = {
+      block: block,
+      text: sel.toString().replace(/\s+/g, " ").trim().slice(0, 500)
+    };
+  }
+
+  function loadAnnQueue() {
+    try {
+      var raw = sessionStorage.getItem(ANN_KEY);
+      var parsed = raw ? JSON.parse(raw) : [];
+      annQueue = Array.isArray(parsed) ? parsed : [];
+    } catch (e) { annQueue = []; }
+  }
+
+  function saveAnnQueue() {
+    try {
+      if (annQueue.length) sessionStorage.setItem(ANN_KEY, JSON.stringify(annQueue));
+      else sessionStorage.removeItem(ANN_KEY);
+    } catch (e) { /* queue survives in memory for this page's lifetime */ }
+  }
+
+  function blockIdentity(node) {
+    var d = node.dataset;
+    var id = { type: d.mdType || "", hash: d.mdHash || "" };
+    if (d.mdType === "tablecell") {
+      id.line = parseInt(d.mdLine, 10);
+      id.cell = parseInt(d.mdCell, 10);
+    } else {
+      id.start = parseInt(d.mdStart, 10);
+      id.end = parseInt(d.mdEnd, 10);
+    }
+    return id;
+  }
+
+  function buildAnnotateToggle() {
+    annToggleBtn = el("button", "webdoc-ann-toggle", "Annotate");
+    annToggleBtn.type = "button";
+    annToggleBtn.title = "Comment on blocks while reading; nothing is sent until you choose";
+    annToggleBtn.addEventListener("click", function () {
+      if (annOn) exitAnnotate();
+      else enterAnnotate();
+    });
+    document.body.appendChild(annToggleBtn);
+    updateAnnBadge();
+  }
+
+  function updateAnnBadge() {
+    if (!annToggleBtn) return;
+    annToggleBtn.textContent = annQueue.length ? "Annotate (" + annQueue.length + ")" : "Annotate";
+    annToggleBtn.classList.toggle("webdoc-ann-queued", annQueue.length > 0);
+  }
+
+  function enterAnnotate() {
+    if (state.on) exitEditMode(); // the two modes are mutually exclusive
+    annOn = true;
+    document.body.classList.add("webdoc-ann-mode");
+    annToggleBtn.classList.add("webdoc-ann-on");
+    if (annQueue.length) showAnnPanel();
+  }
+
+  function exitAnnotate() {
+    annOn = false;
+    annSelection = null;
+    document.body.classList.remove("webdoc-ann-mode");
+    if (annToggleBtn) annToggleBtn.classList.remove("webdoc-ann-on");
+    closeAnnCard();
+    hideAnnPanel();
+  }
+
+  function onAnnotateClick(ev) {
+    if (!annOn) return;
+    if (annCard && annCard.contains(ev.target)) return;
+    if (annPanel && annPanel.contains(ev.target)) return;
+    if (annToggleBtn && annToggleBtn.contains(ev.target)) return;
+    var block = ev.target.closest ? ev.target.closest(EDITABLE) : null;
+    if (!block || block.hasAttribute("data-noedit")) { closeAnnCard(); return; }
+    ev.preventDefault();
+    ev.stopPropagation();
+    openAnnCard(block);
+  }
+
+  function openAnnCard(block) {
+    closeAnnCard();
+    if (annQueue.length >= ANN_QUEUE_MAX) {
+      flash("Annotation queue is full (" + ANN_QUEUE_MAX + ") — send or discard first.");
+      return;
+    }
+    // The stashed selection rides along when it belongs to THIS block, so a
+    // comment can point at words, not just the whole block (the opening click
+    // already collapsed the live selection; see onSelectionChange).
+    var selected = (annSelection && annSelection.block === block) ? annSelection.text : "";
+    annCard = el("div", "webdoc-ann-card");
+    var hint = el("div", "webdoc-ann-hint",
+      selected ? "On: “" + selected.slice(0, 80) + (selected.length > 80 ? "…" : "") + "”"
+               : "On this " + (block.dataset.mdType === "tablecell" ? "cell" : block.dataset.mdType));
+    var input = el("textarea", "webdoc-ann-input");
+    input.placeholder = "Comment… (Enter queues, Esc cancels)";
+    input.rows = 2;
+    var queueBtn = el("button", "webdoc-ann-queue", "Queue");
+    queueBtn.type = "button";
+    function commitCard() {
+      var comment = input.value.replace(/\s+/g, " ").trim();
+      if (!comment) { closeAnnCard(); return; }
+      annQueue.push({
+        block: blockIdentity(block),
+        excerpt: (block.textContent || "").replace(/\s+/g, " ").trim().slice(0, 240),
+        selected: selected ? { text: selected } : undefined,
+        comment: comment.slice(0, 2000),
+        queued_at: new Date().toISOString()
+      });
+      saveAnnQueue();
+      updateAnnBadge();
+      annSelection = null; // used once; never leaks onto a later card
+      closeAnnCard();
+      showAnnPanel();
+    }
+    queueBtn.addEventListener("click", commitCard);
+    input.addEventListener("keydown", function (ev) {
+      if (ev.key === "Enter" && !ev.shiftKey) { ev.preventDefault(); commitCard(); }
+      else if (ev.key === "Escape") { ev.preventDefault(); closeAnnCard(); }
+      ev.stopPropagation();
+    });
+    annCard.appendChild(hint);
+    annCard.appendChild(input);
+    annCard.appendChild(queueBtn);
+    document.body.appendChild(annCard);
+    var rect = block.getBoundingClientRect();
+    annCard.style.top = (window.scrollY + rect.bottom + 6) + "px";
+    annCard.style.left = (window.scrollX + Math.max(8, rect.left)) + "px";
+    input.focus();
+  }
+
+  function closeAnnCard() {
+    if (annCard && annCard.parentNode) annCard.parentNode.removeChild(annCard);
+    annCard = null;
+  }
+
+  function showAnnPanel() {
+    hideAnnPanel();
+    if (!annQueue.length) return;
+    annPanel = el("div", "webdoc-ann-panel");
+    annPanel.appendChild(el("div", "webdoc-ann-panel-head",
+      annQueue.length + " queued — nothing sent yet"));
+    var list = el("div", "webdoc-ann-list");
+    annQueue.forEach(function (item, i) {
+      var row = el("div", "webdoc-ann-item");
+      var txt = el("span", null,
+        (item.selected ? "“" + item.selected.text.slice(0, 40) + "” " : "") + item.comment);
+      txt.title = item.excerpt;
+      var rm = el("button", "webdoc-ann-rm", "×");
+      rm.type = "button";
+      rm.title = "Remove this annotation";
+      rm.addEventListener("click", function () {
+        annQueue.splice(i, 1);
+        saveAnnQueue();
+        updateAnnBadge();
+        showAnnPanel();
+      });
+      row.appendChild(txt);
+      row.appendChild(rm);
+      list.appendChild(row);
+    });
+    annPanel.appendChild(list);
+    var foot = el("div", "webdoc-ann-panel-foot");
+    var send = el("button", "webdoc-ann-send", "Send all (" + annQueue.length + ")");
+    send.type = "button";
+    var discard = el("button", "webdoc-ann-discard", "Discard");
+    discard.type = "button";
+    send.addEventListener("click", sendAnnotations);
+    discard.addEventListener("click", function () {
+      annQueue = [];
+      saveAnnQueue();
+      updateAnnBadge();
+      hideAnnPanel();
+    });
+    foot.appendChild(send);
+    foot.appendChild(discard);
+    annPanel.appendChild(foot);
+    document.body.appendChild(annPanel);
+  }
+
+  function hideAnnPanel() {
+    if (annPanel && annPanel.parentNode) annPanel.parentNode.removeChild(annPanel);
+    annPanel = null;
+  }
+
+  // Send the queue in byte-budgeted chunks so a large queue can never outgrow
+  // the server's request-body cap (each chunk is one feedback.jsonl entry).
+  // Sequential + single-flight, and a chunk leaves the queue only after ITS
+  // send succeeds: a mid-way failure keeps exactly the unsent remainder queued.
+  function annChunkSize() {
+    var n = 1; // one item always fits (~8.5KiB worst case); progress guaranteed
+    while (n < annQueue.length && annBodyBytes(annQueue.slice(0, n + 1)) <= ANN_CHUNK_BYTES) {
+      n++;
+    }
+    return n;
+  }
+
+  function sendAnnotations() {
+    if (!annQueue.length || annSending) return;
+    annSending = true;
+    var total = annQueue.length;
+    function finish(msg) {
+      annSending = false;
+      updateAnnBadge();
+      if (annQueue.length) showAnnPanel();
+      else hideAnnPanel();
+      flash(msg);
+    }
+    function sendNext() {
+      if (!annQueue.length) {
+        finish("Sent " + total + " annotation" + (total === 1 ? "" : "s") + ".");
+        return;
+      }
+      var chunk = annQueue.slice(0, annChunkSize());
+      fetch("/api/feedback", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ kind: "annotations", items: chunk, page: location.pathname })
+      }).then(readJson).then(function (res) {
+        if (!res.ok || !res.body || !res.body.ok) {
+          finish("Couldn't send — " + annQueue.length + " annotation" +
+                 (annQueue.length === 1 ? "" : "s") + " still queued.");
+          return;
+        }
+        annQueue = annQueue.slice(chunk.length);
+        saveAnnQueue();
+        sendNext();
+      }).catch(function () {
+        finish("Couldn't send (offline?) — " + annQueue.length + " still queued.");
+      });
+    }
+    sendNext();
+  }
+
   function init() {
     if (!document.querySelector(EDITABLE)) return; // nothing editable on this page
     buildToggle();
+    buildAnnotateToggle();
     buildToolbar();
+    loadAnnQueue();
+    updateAnnBadge();
     document.addEventListener("mousedown", onMouseDown, true);
     document.addEventListener("keydown", onKeyDown, true);
+    document.addEventListener("click", onAnnotateClick, true);
+    document.addEventListener("selectionchange", onSelectionChange);
     window.addEventListener("scroll", onScrollOrResize, true);
     window.addEventListener("resize", onScrollOrResize);
+    // audit.js reports layout findings; surface errors while editing so the
+    // author sees them where they can act (details are in feedback.jsonl).
+    document.addEventListener("webdoc:layout-findings", function (ev) {
+      var n = ev.detail && ev.detail.errors;
+      if (state.on && n > 0) {
+        flash("Layout: " + n + " issue" + (n === 1 ? "" : "s") + " found — details in feedback.jsonl.");
+      }
+    });
+    restoreAfterReload();
+    seedLiveVersion();
+    setInterval(pollSiteVersion, LIVE_POLL_MS);
   }
 
   if (document.readyState === "loading") {

@@ -8,7 +8,9 @@ import functools
 import http.server
 import ipaddress
 import json
+import math
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -139,6 +141,12 @@ class NoListingHandler(http.server.SimpleHTTPRequestHandler):
         if parsed.path == "/api/health":
             self.send_json(200, {"ok": True, "site_dir": str(self.site_dir())})
             return
+        if parsed.path == "/api/version":
+            # Cheap stat-on-demand version for the client's live-reload poll. No
+            # watcher thread: the mtime IS the generation. A string, because
+            # mtime_ns exceeds JS Number.MAX_SAFE_INTEGER.
+            self.send_json(200, {"v": self._site_version()})
+            return
         if parsed.path == "/api/feedback":
             entries: list[object] = []
             path = feedback_jsonl(self.site_dir())
@@ -212,6 +220,8 @@ class NoListingHandler(http.server.SimpleHTTPRequestHandler):
         parsed = urlparse(self.path)
         if parsed.path == "/api/feedback":
             self.handle_feedback()
+        elif parsed.path == "/api/audit":
+            self.handle_audit()
         elif parsed.path == "/api/edit":
             self.handle_edit()
         elif parsed.path == "/api/undo":
@@ -219,9 +229,19 @@ class NoListingHandler(http.server.SimpleHTTPRequestHandler):
         else:
             self.send_json(404, {"error": "not_found"})
 
+    def _append_feedback(self, entry: dict) -> Path:
+        path = feedback_jsonl(self.site_dir())
+        with FEEDBACK_LOCK:
+            with path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, sort_keys=True) + "\n")
+        return path
+
     def handle_feedback(self) -> None:
         payload = self._read_json_body(MAX_FEEDBACK_BYTES)
         if payload is None:
+            return
+        if payload.get("kind") == "annotations":
+            self._handle_annotations(payload)
             return
         feedback = str(payload.get("feedback", "")).strip()
         if not feedback:
@@ -234,11 +254,119 @@ class NoListingHandler(http.server.SimpleHTTPRequestHandler):
             "feedback": feedback,
             "user_agent": self.headers.get("user-agent", "")[:300],
         }
-        path = feedback_jsonl(self.site_dir())
-        with FEEDBACK_LOCK:
-            with path.open("a", encoding="utf-8") as f:
-                f.write(json.dumps(entry, sort_keys=True) + "\n")
+        path = self._append_feedback(entry)
         self.send_json(200, {"ok": True, "feedback_path": str(path), "received_at": entry["received_at"]})
+
+    @staticmethod
+    def _clean_block(raw: object) -> dict:
+        """Sanitize a client-sent block identity down to the known keys. Values
+        are advisory anchors for the agent (hash-verified against the source at
+        read time, like the edit ledger), never used to write anything."""
+        if not isinstance(raw, dict):
+            return {}
+        out: dict = {}
+        if raw.get("type"):
+            out["type"] = str(raw["type"])[:24]
+        for key in ("start", "end", "line", "cell"):
+            try:
+                out[key] = int(raw[key])
+            except (KeyError, TypeError, ValueError):
+                continue
+        if raw.get("hash"):
+            out["hash"] = str(raw["hash"])[:32]
+        return out
+
+    def _handle_annotations(self, payload: dict) -> None:
+        """One batch of block-anchored annotations, sent when the READER decides
+        (they queue locally while reading; the agent sees one entry per send,
+        never a live stream)."""
+        raw_items = payload.get("items")
+        if not isinstance(raw_items, list) or not raw_items:
+            self.send_json(400, {"error": "empty_annotations"})
+            return
+        items: list[dict] = []
+        for raw in raw_items[:100]:
+            if not isinstance(raw, dict):
+                continue
+            comment = str(raw.get("comment", "")).strip()
+            if not comment:
+                continue
+            item: dict = {
+                "comment": comment[:2000],
+                "block": self._clean_block(raw.get("block")),
+                "excerpt": str(raw.get("excerpt", ""))[:240],
+            }
+            selected = raw.get("selected")
+            if isinstance(selected, dict) and str(selected.get("text", "")).strip():
+                item["selected"] = str(selected["text"])[:500]
+            if raw.get("queued_at"):
+                item["queued_at"] = str(raw["queued_at"])[:40]
+            items.append(item)
+        if not items:
+            self.send_json(400, {"error": "empty_annotations"})
+            return
+        entry = {
+            "received_at": now_iso(),
+            "kind": "annotations",
+            "page": str(payload.get("page", ""))[:300],
+            "count": len(items),
+            "items": items,
+            "user_agent": self.headers.get("user-agent", "")[:300],
+        }
+        path = self._append_feedback(entry)
+        self.send_json(200, {"ok": True, "count": len(items), "feedback_path": str(path)})
+
+    def handle_audit(self) -> None:
+        """Layout-audit findings from the page's own render (assets/audit.js).
+        Telemetry-only: appended to feedback.jsonl for the agent, writes nothing
+        else. The client only posts when the finding set changed, so a clean
+        page costs zero entries."""
+        payload = self._read_json_body(MAX_FEEDBACK_BYTES)
+        if payload is None:
+            return
+        raw_findings = payload.get("findings")
+        if not isinstance(raw_findings, list):
+            self.send_json(400, {"error": "bad_findings"})
+            return
+        findings: list[dict] = []
+        for raw in raw_findings[:200]:
+            if not isinstance(raw, dict):
+                continue
+            kind = str(raw.get("kind", ""))[:40]
+            severity = str(raw.get("severity", ""))
+            if not kind or severity not in ("error", "warning"):
+                continue
+            finding: dict = {
+                "kind": kind,
+                "severity": severity,
+                "selector": str(raw.get("selector", ""))[:300],
+                "persistent": bool(raw.get("persistent")),
+            }
+            for key in ("overflowPx", "viewportWidth"):
+                try:
+                    value = float(raw[key])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                # A crafted client could send Infinity/NaN; json.dumps would emit
+                # bare tokens that break strict JSON consumers of feedback.jsonl.
+                if not math.isfinite(value):
+                    continue
+                finding[key] = round(value, 1)
+            block = self._clean_block(raw.get("block"))
+            if block:
+                finding["block"] = block
+            findings.append(finding)
+        entry = {
+            "received_at": now_iso(),
+            "kind": "layout_warnings",
+            "page": str(payload.get("page", ""))[:300],
+            "count": len(findings),
+            "error_count": sum(1 for f in findings if f["severity"] == "error"),
+            "findings": findings,
+            "user_agent": self.headers.get("user-agent", "")[:300],
+        }
+        path = self._append_feedback(entry)
+        self.send_json(200, {"ok": True, "count": len(findings), "feedback_path": str(path)})
 
     def _require_loopback_edit(self) -> bool:
         """Gate any write path on loopback: the real TCP peer first (unspoofable),
@@ -268,6 +396,25 @@ class NoListingHandler(http.server.SimpleHTTPRequestHandler):
             return None
         return source
 
+    def _site_version(self) -> str:
+        """The served page's generation, matching the client's baseline exactly:
+        the render-time <meta name="webdoc-version"> stamp in index.html (the
+        head fits well inside the first 4KiB). Falls back to mtime_ns for a page
+        built before the stamp existed; "0" when index.html is missing."""
+        index = self.site_dir() / "index.html"
+        try:
+            with index.open("r", encoding="utf-8", errors="replace") as fh:
+                head = fh.read(4096)
+        except OSError:
+            return "0"
+        match = re.search(r'<meta name="webdoc-version" content="(\d+)"', head)
+        if match:
+            return match.group(1)
+        try:
+            return str(index.stat().st_mtime_ns)
+        except OSError:
+            return "0"
+
     def handle_edit(self) -> None:
         if edit_support is None:
             self.send_json(500, {"error": "editing_unavailable"})
@@ -291,6 +438,10 @@ class NoListingHandler(http.server.SimpleHTTPRequestHandler):
                 if status == 200 and create_site is not None:
                     if not create_site.rebuild_html(source, self.site_dir()):
                         self.log_message("rebuild after edit failed; served page may be stale until next rebuild")
+                if status == 200:
+                    # The initiating tab adopts this as its baseline so its own
+                    # rebuild never trips its live-reload poll.
+                    body["site_version"] = self._site_version()
         except Exception as exc:  # never leak a stack trace to the client
             self.log_message("edit error: %r", exc)
             self.send_json(500, {"error": "edit_failed"})
@@ -316,6 +467,8 @@ class NoListingHandler(http.server.SimpleHTTPRequestHandler):
                 if status == 200 and create_site is not None:
                     if not create_site.rebuild_html(source, self.site_dir()):
                         self.log_message("rebuild after undo failed; served page may be stale until next rebuild")
+                if status == 200:
+                    body["site_version"] = self._site_version()
         except Exception as exc:  # never leak a stack trace to the client
             self.log_message("undo error: %r", exc)
             self.send_json(500, {"error": "undo_failed"})

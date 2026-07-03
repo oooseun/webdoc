@@ -23,6 +23,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -651,6 +652,11 @@ def render_html(
     source_name = html.escape(Path(source).name, quote=True)
     title_html = html.escape(title)
     artifact_json = json.dumps(str(manifest["artifact_id"]))
+    # Render-time version stamp. The live-reload client seeds its baseline from
+    # this meta tag (the version of the DOM it is actually showing), so a
+    # rebuild landing before its first poll is still caught. /api/version
+    # reads the same stamp back out of index.html.
+    version_ns = str(time.time_ns())
 
     if toc:
         toc_items = "\n".join(
@@ -672,9 +678,10 @@ def render_html(
         scripts += '\n    <script src="./stepper.js" defer></script>'
     for name in (custom_js or []):
         scripts += f'\n    <script src="./{html.escape(name, quote=True)}" defer></script>'
-    # Editing mode: bundled into the interactive site only. Inert until the
-    # reader clicks Edit; the doc.html export never loads this.
+    # Editing mode + layout audit: bundled into the interactive site only. Both
+    # are inert on a file:// open; the doc.html export never loads them.
     scripts += '\n    <script src="./edit.js" defer></script>'
+    scripts += '\n    <script src="./audit.js" defer></script>'
 
     return f"""<!doctype html>
 <html lang="en">
@@ -682,6 +689,8 @@ def render_html(
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{title_html}</title>
+  <meta name="webdoc-version" content="{version_ns}">
+  <link rel="icon" href="data:,">
   <link rel="stylesheet" href="./style.css">{css_links}
   <link rel="stylesheet" href="./edit.css">
 </head>
@@ -965,10 +974,11 @@ def main() -> int:
     shutil.copyfile(resolve_template(args.template), out_dir / "style.css")
     if state.get("stepper"):
         shutil.copyfile(SKILL_DIR / "assets" / "stepper.js", out_dir / "stepper.js")
-    # Editing-mode assets, bundled into every site (index.html links them; the
-    # doc.html export does not). Inert until the reader clicks Edit.
+    # Editing-mode + layout-audit assets, bundled into every site (index.html
+    # links them; the doc.html export does not). Inert until served.
     shutil.copyfile(SKILL_DIR / "assets" / "edit.js", out_dir / "edit.js")
     shutil.copyfile(SKILL_DIR / "assets" / "edit.css", out_dir / "edit.css")
+    shutil.copyfile(SKILL_DIR / "assets" / "audit.js", out_dir / "audit.js")
 
     for asset in args.asset:
         copy_into(Path(asset), out_dir, subdir="assets")

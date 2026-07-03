@@ -66,6 +66,13 @@ h1 {
   font-size: 0.92rem;
 }
 
+/* A long source path is one unbreakable token; without this it forces the
+   whole page wider than a phone viewport (sideways scrolling). */
+.meta span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
 .layout {
   display: grid;
   grid-template-columns: 260px minmax(0, 1fr);
