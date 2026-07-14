@@ -46,11 +46,42 @@ LOOPBACK_EDIT_MESSAGE = (
     "serving it to edit. Viewing and feedback work over the network; editing "
     "does not."
 )
-DEFAULT_TTL_SECONDS = 4 * 60 * 60
+# TTL is now a backstop, not the primary lifetime control: the page heartbeat +
+# idle shutdown reclaim a server once its last tab goes away, so a long TTL is
+# safe. 7 days covers a week-long review without a manual restart.
+DEFAULT_TTL_SECONDS = 7 * 24 * 60 * 60
+# Shut down this long after the last request when no open tab is pinging. Chrome
+# throttles a hidden tab's timers to roughly one fire per minute, so the page's
+# 20-second heartbeat still lands several times inside a 30-minute window.
+DEFAULT_IDLE_TIMEOUT_SECONDS = 30 * 60
+WATCHDOG_POLL_SECONDS = 15
+IDLE_GRACE_SECONDS = 60
 MAX_FEEDBACK_BYTES = 64 * 1024
 MAX_EDIT_BYTES = 512 * 1024
+MAX_HEARTBEAT_BYTES = 4 * 1024
 FEEDBACK_LOCK = threading.Lock()
 EDIT_LOCK = threading.Lock()
+
+# Injected server-side into every served .html so old builds participate in idle
+# shutdown with no rebuild. One line, no dependencies, all errors swallowed:
+# ping once, then every 20 seconds, and again whenever a hidden tab is reshown.
+HEARTBEAT_SNIPPET = (
+    b'<script>(function(){var p=function(){try{fetch("/api/heartbeat",'
+    b'{method:"POST",keepalive:true}).catch(function(){});}catch(e){}};p();'
+    b'setInterval(p,20000);document.addEventListener("visibilitychange",'
+    b'function(){if(!document.hidden){p();}});})();</script>'
+)
+_BODY_CLOSE_RE = re.compile(rb"</body\s*>", re.IGNORECASE)
+
+
+def inject_heartbeat(raw: bytes) -> bytes:
+    """Insert HEARTBEAT_SNIPPET before the last </body> (case-insensitive, at the
+    byte level), or append it when the document has no </body>."""
+    matches = list(_BODY_CLOSE_RE.finditer(raw))
+    if matches:
+        at = matches[-1].start()
+        return raw[:at] + HEARTBEAT_SNIPPET + raw[at:]
+    return raw + HEARTBEAT_SNIPPET
 
 
 def now_iso() -> str:
@@ -136,7 +167,18 @@ class NoListingHandler(http.server.SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _touch_activity(self) -> None:
+        """Record this request as activity on the server (guarded so a handler
+        built without a live server, as the test harness does, does not break)."""
+        touch = getattr(getattr(self, "server", None), "touch", None)
+        if callable(touch):
+            touch()
+
+    def _idle_enabled(self) -> bool:
+        return bool(getattr(getattr(self, "server", None), "idle_shutdown_enabled", False))
+
     def do_GET(self) -> None:
+        self._touch_activity()
         parsed = urlparse(self.path)
         if parsed.path == "/api/health":
             self.send_json(200, {"ok": True, "site_dir": str(self.site_dir())})
@@ -160,7 +202,27 @@ class NoListingHandler(http.server.SimpleHTTPRequestHandler):
                         entries.append({"error": "bad_feedback_line", "raw": line})
             self.send_json(200, {"feedback_path": str(path), "entries": entries})
             return
+        if self._forbidden_static_path(self.path):
+            self.send_error(404, "File not found")
+            return
+        if self._idle_enabled():
+            html_file = self._resolve_html_file()
+            if html_file is not None:
+                self._serve_html_with_heartbeat(html_file)
+                return
         super().do_GET()
+
+    def do_HEAD(self) -> None:
+        self._touch_activity()
+        if self._forbidden_static_path(self.path):
+            self.send_error(404, "File not found")
+            return
+        if self._idle_enabled():
+            html_file = self._resolve_html_file()
+            if html_file is not None:
+                self._serve_html_with_heartbeat(html_file, head_only=True)
+                return
+        super().do_HEAD()
 
     def _peer_is_loopback(self) -> bool:
         """True when the connecting TCP peer is a loopback address.
@@ -217,6 +279,7 @@ class NoListingHandler(http.server.SimpleHTTPRequestHandler):
         return payload
 
     def do_POST(self) -> None:
+        self._touch_activity()
         parsed = urlparse(self.path)
         if parsed.path == "/api/feedback":
             self.handle_feedback()
@@ -226,8 +289,35 @@ class NoListingHandler(http.server.SimpleHTTPRequestHandler):
             self.handle_edit()
         elif parsed.path == "/api/undo":
             self.handle_undo()
+        elif parsed.path == "/api/heartbeat":
+            self.handle_heartbeat()
         else:
             self.send_json(404, {"error": "not_found"})
+
+    def handle_heartbeat(self) -> None:
+        """Keep-alive ping from an open tab. The activity touch already happened in
+        do_POST; the body is ignored (read and discarded within a cap so a stuck or
+        oversized client cannot tie up the handler). Zero-length and non-JSON bodies
+        are fine. Reachable over the LAN too, so a --allow-lan viewer keeps it up."""
+        try:
+            length = int(self.headers.get("content-length", "0"))
+        except ValueError:
+            length = 0
+        if length > MAX_HEARTBEAT_BYTES:
+            # Drain a bounded slice so the 413 reaches the client cleanly rather than
+            # racing a connection reset, without buffering an unbounded body.
+            try:
+                self.rfile.read(MAX_HEARTBEAT_BYTES)
+            except Exception:
+                pass
+            self.send_json(413, {"error": "body_too_large", "limit_bytes": MAX_HEARTBEAT_BYTES})
+            return
+        if length > 0:
+            try:
+                self.rfile.read(length)
+            except Exception:
+                pass
+        self.send_json(200, {"ok": True})
 
     def _append_feedback(self, entry: dict) -> Path:
         path = feedback_jsonl(self.site_dir())
@@ -475,6 +565,81 @@ class NoListingHandler(http.server.SimpleHTTPRequestHandler):
             return
         self.send_json(status, body)
 
+    # Site control files that must never be served: they carry server state,
+    # feedback, the manifest, and the edit ledger. *.edits.json is matched by
+    # suffix. Page assets (index.html, doc.html, style.css, assets/*, the bundled
+    # JS) are not in this set and keep serving.
+    _CONTROL_FILES = {"server.json", "server.log", "feedback.jsonl", "manifest.json"}
+
+    def _forbidden_static_path(self, url_path: str) -> bool:
+        """True when a GET/HEAD resolves to a control file or any dotfile/dot-dir,
+        which the server must refuse. The check is on the resolved filesystem path
+        (via translate_path) so percent-encoding and '.'/'..' segments cannot slip
+        a control file through. /api/* is routed before this and is unaffected."""
+        try:
+            resolved = Path(self.translate_path(url_path)).resolve()
+            site = self.site_dir()
+            rel = resolved.relative_to(site)
+        except ValueError:
+            # translate_path clamps into the served tree; anything that still lands
+            # outside it is refused rather than served.
+            return True
+        parts = rel.parts
+        if not parts:
+            return False  # the site root itself -> index.html handling downstream
+        for segment in parts:
+            if segment.startswith("."):
+                return True
+        # Compare case-insensitively: macOS's default filesystem is
+        # case-insensitive while Path.resolve() preserves the REQUESTED case, so
+        # a case-sensitive check would pass /SERVER.JSON straight through to the
+        # OS, which opens the real server.json. On a case-sensitive filesystem
+        # the case-varied name is a different, nonexistent file, so refusing it
+        # loses nothing.
+        name = parts[-1].lower()
+        return name in self._CONTROL_FILES or name.endswith(".edits.json")
+
+    def _resolve_html_file(self) -> "Path | None":
+        """The existing .html file this GET would serve, mirroring
+        SimpleHTTPRequestHandler: a directory maps to its index.html only when the
+        URL path ends with '/'. None for non-HTML targets and the no-slash
+        directory case (left to the base handler's 301 redirect)."""
+        clean = self.path.split("?", 1)[0].split("#", 1)[0]
+        p = Path(self.translate_path(self.path))
+        if p.is_dir():
+            if not clean.endswith("/"):
+                return None
+            for index in ("index.html", "index.htm"):
+                candidate = p / index
+                if candidate.is_file():
+                    return candidate
+            return None
+        if p.is_file() and p.suffix.lower() in (".html", ".htm"):
+            # Never inject into the doc export: it is the artifact users save and
+            # upload to Google Docs, its contract is script-free, and it must stay
+            # byte-identical however it is fetched.
+            if p.name.lower() == "doc.html":
+                return None
+            return p
+        return None
+
+    def _serve_html_with_heartbeat(self, path: Path, head_only: bool = False) -> None:
+        """Serve an .html file with the keep-alive snippet injected. Content-Length
+        is recomputed; the type is whatever guess_type reports (text/html).
+        head_only sends the same headers with no body, so a HEAD reports exactly
+        what the corresponding GET would send (RFC 7231 section 4.3.2)."""
+        try:
+            body = inject_heartbeat(path.read_bytes())
+        except OSError:
+            self.send_error(404, "File not found")
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", self.guess_type(str(path)))
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if not head_only:
+            self.wfile.write(body)
+
     def list_directory(self, path: str):  # type: ignore[override]
         self.send_error(403, "Directory listing disabled")
         return None
@@ -489,12 +654,66 @@ class NoListingHandler(http.server.SimpleHTTPRequestHandler):
 
 class ThreadingHTTPServer(ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
+    # Set by run_server; gates server-side heartbeat-snippet injection so pages
+    # only carry the ping when idle shutdown is actually watching.
+    idle_shutdown_enabled = False
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        # Set before binding so a request handled during startup never races an
+        # unset attribute.
+        self._activity_lock = threading.Lock()
+        self._last_activity = time.monotonic()
+        super().__init__(*args, **kwargs)  # type: ignore[arg-type]
+
+    def touch(self) -> None:
+        with self._activity_lock:
+            self._last_activity = time.monotonic()
+
+    def idle_seconds(self) -> float:
+        with self._activity_lock:
+            return time.monotonic() - self._last_activity
 
 
-def run_server(site_dir: Path, host: str, port: int, ttl: int) -> int:
+def _watch(httpd: ThreadingHTTPServer, deadline: "float | None", idle_timeout: float,
+           poll: float, grace: float, stop_event: threading.Event) -> "str | None":
+    """Block until the TTL deadline passes or the server has been idle long enough,
+    returning the shutdown reason ("ttl" or "idle"), or None if serving stopped for
+    another cause first (the stop_event is set in run_server's finally).
+
+    time.monotonic() does not advance while macOS is asleep, so neither the idle
+    clock nor the TTL counts sleep time: a laptop shut overnight resumes with the
+    same remaining budget.
+
+    Idle shutdown never fires on first sight of an over-threshold reading. It arms
+    a strike, then only shuts down if the server is STILL idle at least `grace`
+    seconds later. Any request in between clears the strike. This absorbs the
+    wake-from-sleep race where the watchdog samples before a re-shown tab's first
+    heartbeat lands."""
+    idle_since: "float | None" = None
+    while not stop_event.is_set():
+        now = time.monotonic()
+        if deadline is not None and now >= deadline:
+            return "ttl"
+        if idle_timeout > 0:
+            if httpd.idle_seconds() > idle_timeout:
+                if idle_since is None:
+                    idle_since = now
+                elif (now - idle_since) >= grace and httpd.idle_seconds() > idle_timeout:
+                    return "idle"
+            else:
+                idle_since = None
+        if stop_event.wait(poll):  # returns True once serving has stopped
+            return None
+    return None
+
+
+def run_server(site_dir: Path, host: str, port: int, ttl: int, idle_timeout: float,
+               poll_interval: float = WATCHDOG_POLL_SECONDS,
+               idle_grace: float = IDLE_GRACE_SECONDS) -> int:
     validate_site(site_dir)
     handler = functools.partial(NoListingHandler, directory=str(site_dir))
     httpd = ThreadingHTTPServer((host, port), handler)
+    httpd.idle_shutdown_enabled = idle_timeout > 0
     actual_port = int(httpd.server_address[1])
     pid = os.getpid()
     info = {
@@ -505,32 +724,47 @@ def run_server(site_dir: Path, host: str, port: int, ttl: int) -> int:
         "site_dir": str(site_dir),
         "started_at": now_iso(),
         "ttl_seconds": ttl,
+        "idle_timeout_seconds": idle_timeout,
         "command": " ".join(sys.argv),
         "manager": "webdoc/serve_site.py",
     }
     server_json(site_dir).write_text(json.dumps(info, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
+    # Why the server stopped: "ttl" | "idle" | "signal". The signal handler and
+    # the watchdog both write here; whichever fires first wins.
+    shutdown_reason: dict[str, "str | None"] = {"reason": None}
+
     def shutdown(signum: int, frame: object) -> None:
+        shutdown_reason["reason"] = "signal"
         threading.Thread(target=httpd.shutdown, daemon=True).start()
 
-    signal.signal(signal.SIGTERM, shutdown)
-    signal.signal(signal.SIGINT, shutdown)
+    try:
+        signal.signal(signal.SIGTERM, shutdown)
+        signal.signal(signal.SIGINT, shutdown)
+    except ValueError:
+        # signal.signal only works in the main thread; when run_server is driven
+        # from a worker thread (tests) the watchdog and explicit shutdown suffice.
+        pass
 
-    if ttl > 0:
-        deadline = time.monotonic() + ttl
+    stop_event = threading.Event()
+    if ttl > 0 or idle_timeout > 0:
+        deadline = time.monotonic() + ttl if ttl > 0 else None
 
-        def ttl_loop() -> None:
-            while time.monotonic() < deadline:
-                time.sleep(min(5, max(0.1, deadline - time.monotonic())))
-            httpd.shutdown()
+        def watchdog() -> None:
+            reason = _watch(httpd, deadline, idle_timeout, poll_interval, idle_grace, stop_event)
+            if reason and shutdown_reason["reason"] is None:
+                shutdown_reason["reason"] = reason
+                httpd.shutdown()
 
-        threading.Thread(target=ttl_loop, daemon=True).start()
+        threading.Thread(target=watchdog, daemon=True).start()
 
     try:
         httpd.serve_forever(poll_interval=0.5)
     finally:
+        stop_event.set()  # release the watchdog
         httpd.server_close()
         info["stopped_at"] = now_iso()
+        info["shutdown_reason"] = shutdown_reason["reason"]
         try:
             server_json(site_dir).write_text(json.dumps(info, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         except OSError:
@@ -554,7 +788,7 @@ def open_url(url: str) -> bool:
         return False
 
 
-def start(site_dir: Path, host: str, port: int, ttl: int, allow_lan: bool, allow_symlinks: bool, want_open: bool = False) -> int:
+def start(site_dir: Path, host: str, port: int, ttl: int, idle_timeout: int, allow_lan: bool, allow_symlinks: bool, want_open: bool = False) -> int:
     if host not in LOOPBACK_HOSTS and not allow_lan:
         raise SystemExit("refusing non-loopback host without --allow-lan")
     validate_site(site_dir, allow_symlinks=allow_symlinks)
@@ -582,6 +816,8 @@ def start(site_dir: Path, host: str, port: int, ttl: int, allow_lan: bool, allow
         str(port),
         "--ttl",
         str(ttl),
+        "--idle-timeout",
+        str(idle_timeout),
     ]
     child = subprocess.Popen(
         cmd,
@@ -676,7 +912,8 @@ def main() -> int:
     p_start.add_argument("site")
     p_start.add_argument("--host", default="127.0.0.1")
     p_start.add_argument("--port", type=int, default=0, help="0 lets the OS choose an unused port")
-    p_start.add_argument("--ttl", type=int, default=DEFAULT_TTL_SECONDS, help="Seconds before auto-shutdown; 0 disables TTL")
+    p_start.add_argument("--ttl", type=int, default=DEFAULT_TTL_SECONDS, help="Seconds before the TTL backstop shuts the server down (default 7 days); 0 disables TTL")
+    p_start.add_argument("--idle-timeout", type=int, default=DEFAULT_IDLE_TIMEOUT_SECONDS, help="Seconds of no requests before idle shutdown (default 30 min); the served page's heartbeat keeps an open tab alive, so this fires after the last tab goes away. 0 disables idle shutdown")
     p_start.add_argument("--allow-lan", action="store_true")
     p_start.add_argument("--allow-symlinks", action="store_true")
     p_start.add_argument("--open", dest="open", action="store_true", help="Open the site in the browser after start (overrides config)")
@@ -697,6 +934,7 @@ def main() -> int:
     p_run.add_argument("--host", required=True)
     p_run.add_argument("--port", type=int, required=True)
     p_run.add_argument("--ttl", type=int, required=True)
+    p_run.add_argument("--idle-timeout", type=int, required=True)
 
     args = parser.parse_args()
     if args.command == "start":
@@ -705,7 +943,7 @@ def main() -> int:
             want_open = False
         elif args.open:
             want_open = True
-        return start(resolve_site(args.site), args.host, args.port, args.ttl, args.allow_lan, args.allow_symlinks, want_open=want_open)
+        return start(resolve_site(args.site), args.host, args.port, args.ttl, args.idle_timeout, args.allow_lan, args.allow_symlinks, want_open=want_open)
     if args.command == "stop":
         return stop(resolve_site(args.site))
     if args.command == "status":
@@ -713,7 +951,7 @@ def main() -> int:
     if args.command == "cleanup":
         return cleanup(args.root, stop_running=args.stop_running)
     if args.command == "run-server":
-        return run_server(resolve_site(args.site), args.host, args.port, args.ttl)
+        return run_server(resolve_site(args.site), args.host, args.port, args.ttl, args.idle_timeout)
     raise SystemExit(f"unknown command: {args.command}")
 
 

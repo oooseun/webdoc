@@ -14,7 +14,7 @@ Every diagram is a self-contained, scoped, offline HTML fragment dropped into on
 - put the claim-sentence title in a real HTML element above the SVG (a `<p>`/`<h*>`), not only in an SVG `<text>` node, so it survives the JS-off frame and the document outline,
 - use direct on-figure labels, not a separate legend. A color-swatch legend never counts as a label, and never as the second channel for a filled mark.
 
-If a diagram needs a chart library, pre-render it to SVG at build time and inline the SVG. Do not ship client-side Mermaid/D2/Graphviz bundles.
+If a diagram needs a chart library, pre-render it to SVG at build time and inline the SVG. Do not ship your own client-side D2/Graphviz bundles. Mermaid is the one exception: webdoc vendors it, so a `mermaid` fence renders in the website with no extra bundle. Pre-render Mermaid to SVG when the diagram must survive the `doc.html` export, which is script-free.
 
 ## Tool per job
 
@@ -23,8 +23,8 @@ If a diagram needs a chart library, pre-render it to SVG at build time and inlin
 | Structure / mechanism / topology (torus, datapath, CAM lifecycle) | hand-authored inline SVG + ~30 lines vanilla JS | inline, default choice |
 | Nested block / containment (chip → tile → router) | D2 | `d2 in.d2 out.svg`, inline the SVG |
 | Mesh/torus auto-layout seed | Graphviz `neato`/`fdp` `-n` | pre-render to SVG, then hand-tune |
-| Sequence / handshake | Mermaid `sequenceDiagram` | `mmdc` to SVG, inline |
-| Decision tree (≤15 nodes) | Mermaid `flowchart TD` | `mmdc` to SVG, inline |
+| Sequence / handshake | Mermaid `sequenceDiagram` | `mermaid` fence in-site, or `mmdc` to SVG for the doc export |
+| Decision tree (≤15 nodes) | Mermaid `flowchart TD` | `mermaid` fence in-site, or `mmdc` to SVG for the doc export |
 | Quantitative chart (bars, log-scale, proportions) | Observable Plot (local UMD) or hand SVG | inline data, local bundle, or hand SVG |
 | Parameter sensitivity | native `<input type=range>` + inline SVG, pure-JS recompute | inline |
 | Clock/pipeline timing | WaveDrom (local) or a CSS-grid stage×cycle | inline |

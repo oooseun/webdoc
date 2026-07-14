@@ -414,3 +414,31 @@ audio {
   grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
   gap: 10px;
 }
+
+/* Mermaid diagrams: the ```mermaid fence renders client-side into an SVG. The
+   <pre class="mermaid"> is the visible fallback while the library loads and on
+   a render error. */
+.mermaid-figure {
+  margin: 0 0 1.1rem;
+  overflow-x: auto;
+  text-align: center;
+}
+
+.mermaid-rendered svg {
+  max-width: 100%;
+  height: auto;
+}
+
+pre.mermaid {
+  overflow-x: auto;
+  padding: 16px;
+  text-align: left;
+  background: #101719;
+  color: #eef5f2;
+}
+
+/* A diagram that failed to render keeps its source visible with a warning rail
+   so a broken diagram is obvious rather than silently missing. */
+pre.mermaid.mermaid-error {
+  border-left: 4px solid var(--accent-2);
+}

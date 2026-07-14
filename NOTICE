@@ -42,3 +42,10 @@ referenced and re-expressed in our own words and examples; no passage is
 reproduced verbatim.
 Source: https://en.wikipedia.org/wiki/Wikipedia:Signs_of_AI_writing
 License: CC BY-SA 4.0.
+
+------------------------------------------------------------------------
+Mermaid — diagramming library, version 11.16.0, vendored as
+assets/mermaid.min.js and rendered client-side for ```mermaid fences.
+Source: https://cdn.jsdelivr.net/npm/mermaid@11.16.0/dist/mermaid.min.js
+License: MIT. Copyright (c) 2014-present Knut Sveidqvist and Mermaid
+contributors. Same MIT terms as above apply.

@@ -435,7 +435,7 @@ def parse_markdown(markdown: str, mode: str = "site") -> tuple[str, list[dict[st
     out: list[str] = []
     toc: list[dict[str, str]] = []
     used_ids: set[str] = set()
-    state: dict = {"dropped": set(), "stepper": False, "embed": False}
+    state: dict = {"dropped": set(), "stepper": False, "embed": False, "mermaid": False}
     # Edit-mode block identity is emitted only for the interactive site, never
     # the doc.html export (which must stay clean for the Google Docs path).
     editable = mode == "site"
@@ -490,6 +490,23 @@ def parse_markdown(markdown: str, mode: str = "site") -> tuple[str, list[dict[st
                 embed_end = block_start + 1 + len(code_lines)
                 stamp = embed_start if mode == "site" else 0
                 out.append(render_embed(block, mode, state, stamp, embed_end))
+                continue
+            if language == "mermaid":
+                if mode == "doc":
+                    # doc.html is script-free for the Google Docs import path, so the
+                    # diagram cannot render there: show its source as a code block and
+                    # record it as dropped so the build reports it.
+                    state["dropped"].add(
+                        "mermaid diagrams (the doc shows the diagram source; the website renders them)")
+                    out.append(f'<pre><code class="language-mermaid">{html.escape(block)}</code></pre>')
+                    continue
+                state["mermaid"] = True
+                # data-noedit keeps the in-page editor view-only, like stepper/embeds.
+                # mermaid-init.js reads the escaped source back via textContent (which
+                # un-escapes it) before handing it to the renderer.
+                out.append(
+                    '<figure class="mermaid-figure" data-noedit>'
+                    f'<pre class="mermaid">{html.escape(block)}</pre></figure>')
                 continue
             class_attr = f' class="language-{html.escape(language, quote=True)}"' if language else ""
             out.append(f"<pre{noedit}><code{class_attr}>{html.escape(block)}</code></pre>")
@@ -646,6 +663,7 @@ def render_html(
     custom_css: list[str] | None = None,
     custom_js: list[str] | None = None,
     include_stepper: bool = False,
+    include_mermaid: bool = False,
 ) -> str:
     generated = html.escape(str(manifest["generated_at"]))
     source_display = html.escape(str(source))
@@ -676,6 +694,11 @@ def render_html(
     scripts = ""
     if include_stepper:
         scripts += '\n    <script src="./stepper.js" defer></script>'
+    if include_mermaid:
+        # defer preserves order for classic scripts, so mermaid-init.js runs after
+        # the library has defined window.mermaid.
+        scripts += '\n    <script src="./mermaid.min.js" defer></script>'
+        scripts += '\n    <script src="./mermaid-init.js" defer></script>'
     for name in (custom_js or []):
         scripts += f'\n    <script src="./{html.escape(name, quote=True)}" defer></script>'
     # Editing mode + layout audit: bundled into the interactive site only. Both
@@ -903,10 +926,24 @@ def rebuild_html(source_path: str | Path, out_dir: str | Path) -> bool:
             pass
         manifest["generated_at"] = now_iso()
 
+        include_mermaid = bool(state.get("mermaid"))
+        if include_mermaid:
+            # An edit-triggered rebuild must never produce a page that references an
+            # absent script, so copy the mermaid assets in when they are missing
+            # (e.g. a hand-cleaned site dir). Best-effort: a copy failure must not
+            # break the rebuild's never-raise contract.
+            for asset_name in ("mermaid.min.js", "mermaid-init.js"):
+                dest = out_dir / asset_name
+                if not dest.exists():
+                    try:
+                        shutil.copyfile(SKILL_DIR / "assets" / asset_name, dest)
+                    except OSError:
+                        pass
+
         page = render_html(
             title, source.resolve(), body_html, toc, manifest,
             custom_css=custom_css, custom_js=custom_js,
-            include_stepper=bool(state.get("stepper")),
+            include_stepper=bool(state.get("stepper")), include_mermaid=include_mermaid,
         )
         doc_page = render_doc_html(title, doc_body)
 
@@ -974,6 +1011,9 @@ def main() -> int:
     shutil.copyfile(resolve_template(args.template), out_dir / "style.css")
     if state.get("stepper"):
         shutil.copyfile(SKILL_DIR / "assets" / "stepper.js", out_dir / "stepper.js")
+    if state.get("mermaid"):
+        shutil.copyfile(SKILL_DIR / "assets" / "mermaid.min.js", out_dir / "mermaid.min.js")
+        shutil.copyfile(SKILL_DIR / "assets" / "mermaid-init.js", out_dir / "mermaid-init.js")
     # Editing-mode + layout-audit assets, bundled into every site (index.html
     # links them; the doc.html export does not). Inert until served.
     shutil.copyfile(SKILL_DIR / "assets" / "edit.js", out_dir / "edit.js")
@@ -1021,7 +1061,8 @@ def main() -> int:
 
     page = render_html(
         title, source.resolve(), body_html, toc, manifest,
-        custom_css=custom_css, custom_js=custom_js, include_stepper=bool(state.get("stepper")),
+        custom_css=custom_css, custom_js=custom_js,
+        include_stepper=bool(state.get("stepper")), include_mermaid=bool(state.get("mermaid")),
     )
     doc_page = render_doc_html(title, doc_body)
 

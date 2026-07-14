@@ -128,6 +128,17 @@ webdoc generates the controls and includes `stepper.js`. In the doc export the s
 
 Embeds are injected verbatim (local-only; never host an embed that carries secrets off this machine). Bundle files with flags: `--asset clip.mp3` copies into the site's `assets/` (reference it as `assets/clip.mp3`); `--css custom.css` and `--js widget.js` bundle and link extra styles/scripts.
 
+**Mermaid diagram**: for a quick flowchart, sequence, or graph, use a `mermaid` fence. The website renders it client-side with the vendored library:
+
+````
+```mermaid
+flowchart TD
+  A[Draft] --> B[Review] --> C[Publish]
+```
+````
+
+The doc export runs no scripts, so there it shows the diagram source as a code block instead. When the diagram must appear in the Google Doc, pre-render it to SVG (see `references/diagramming.md`).
+
 Never use looping CSS keyframes or GIFs for technical content. They are noisy and hard to read. A `stepper` is almost always the better tool.
 
 ## Concept Variations
@@ -221,7 +232,7 @@ if check_overrides(source_path, current_block_markdown):
 Prefer a diagram whenever a relationship is structural, comparative, a flow, a mechanism, a magnitude, or a change over time. Reach for one by default for those, not only when prose fails; skip it only when the content is genuinely linear. No decorative charts. **For the full system (Okabe-Ito style grammar, the self-contained offline scoped-embed contract, the stepper recipe, the build-with-subagents pattern, the token-budget gotcha, and the render/verify gates), read `references/diagramming.md`. Follow it for any non-trivial diagram or interactive visual.**
 
 - **Data charts:** hand-authored inline SVG, or Observable Plot / Vega-Lite pre-rendered, with explicit data and chart spec, injected via an `embed` block. Magnitudes over many orders of magnitude use dots/lollipops on a log axis, never filled bars.
-- **Static system/process diagrams:** hand-authored SVG when layout precision matters (the usual choice for topology and mechanism); D2/Graphviz/Mermaid pre-rendered to SVG otherwise.
+- **Static system/process diagrams:** hand-authored SVG when layout precision matters (the usual choice for topology and mechanism); D2/Graphviz pre-rendered to SVG otherwise. A `mermaid` fence now renders in the website via the vendored library, so reach for it when a quick flowchart or sequence diagram is enough; pre-render to SVG when the diagram must survive the `doc.html` export.
 - **Change over time / mechanism:** use a `stepper` (click-to-advance), not animation; draw the scene once and toggle classes per step (see the stepper recipe). If motion is genuinely required, keep it user-triggered with a reduced-motion fallback and a static fallback frame, never an infinite loop.
 
 Prompting rules: state the question each visual answers before choosing a form; specify data fields, units, encodings, sort order, and what to leave out; separate data transformation from visual encoding; render and critique the result for accuracy, labels, axes, contrast, and responsive sizing. Keep all visual source beside the website so future agents can edit it.
@@ -234,13 +245,13 @@ Prompting rules: state the question each visual answers before choosing a form; 
 - Hosted previews must bind to `127.0.0.1` by default. Require explicit user intent for LAN exposure.
 - Use OS-assigned ports by default and write the resolved URL to `server.json`.
 - Stop only servers recorded in a manifest and owned by this workflow. Never kill "whatever owns port 3000".
-- Use TTLs for background servers. The serve script defaults to a finite lifetime and supports explicit `stop`.
+- Background servers shut themselves down. The served page sends a heartbeat, so the server stops on its own about 30 minutes after the last open tab goes away (`--idle-timeout`, `0` disables). A 7-day TTL backstops that (`--ttl`, `0` disables), and explicit `stop` always works. `server.json` records why it stopped in `shutdown_reason` (`idle`, `ttl`, or `signal`).
 - Avoid symlinks in generated website directories. Local static servers can follow symlinks and escape the intended tree.
 
 ## Scripts
 
 - `scripts/create_site.py`: Convert a Markdown/report source into a unified static website (`index.html`, `style.css`, `manifest.json`, feedback UI) plus the self-contained `doc.html` export. Supports `stepper`/`embed` blocks, `[+]/[-]/[~]` table cells, `--template`, and `--css/--js/--asset` bundling.
-- `scripts/serve_site.py`: Start, stop, inspect, or clean up a localhost-only preview server with `server.json`, durable `feedback.jsonl`, and config-driven auto-open.
+- `scripts/serve_site.py`: Start, stop, inspect, or clean up a localhost-only preview server with `server.json`, durable `feedback.jsonl`, config-driven auto-open, heartbeat-driven idle shutdown (default 30 minutes after the last tab closes), and a 7-day TTL backstop.
 - `scripts/templates.py`: List built-in templates and save a stylesheet as a private reusable category.
 - `scripts/gallery.py`: Assemble a concepts gallery (one switcher page over several built concept sites) for the Concept Variations workflow.
 - `scripts/settings.py`: Read user config from `~/.config/webdoc/settings.json`.
@@ -255,7 +266,8 @@ Useful commands:
 python3 scripts/create_site.py report.md
 python3 scripts/create_site.py report.md --out ./report_site --title "Research Report"
 python3 scripts/create_site.py report.md --css custom.css --js widget.js --asset clip.mp3
-python3 scripts/serve_site.py start ./report_site --ttl 7200   # auto-opens per config
+python3 scripts/serve_site.py start ./report_site               # 7-day TTL, idle shutdown ~30 min after the last tab closes
+python3 scripts/serve_site.py start ./report_site --idle-timeout 0 --ttl 7200   # no idle shutdown, hard 2-hour TTL
 python3 scripts/serve_site.py start ./report_site --no-open
 python3 scripts/serve_site.py status ./report_site
 python3 scripts/serve_site.py stop ./report_site
