@@ -563,6 +563,15 @@ def parse_markdown(markdown: str, mode: str = "site") -> tuple[str, list[dict[st
             out.append("".join(table))
             continue
 
+        # Thematic break. Recognised only at a block start, which this loop only
+        # reaches after a blank line, so a `---` sitting directly under a line of
+        # prose stays part of that paragraph instead of silently becoming a setext
+        # heading the rest of this parser cannot render.
+        if re.fullmatch(r"([-*_])(?:[ \t]*\1){2,}[ \t]*", stripped):
+            out.append(f"<hr{noedit}>")
+            i += 1
+            continue
+
         if re.match(r"^\s*[-*]\s+", line):
             items: list[tuple[str, int]] = []
             while i < len(lines) and re.match(r"^\s*[-*]\s+", lines[i]):
@@ -798,6 +807,7 @@ pre { background: #f2f2f2; padding: 10px; overflow-x: auto; }
 pre code { background: transparent; padding: 0; }
 ol.stepper-static { padding-left: 1.4em; }
 blockquote { margin: 0 0 1em; padding-left: 1em; border-left: 3px solid #ccc; color: #444; }
+hr { border: 0; border-top: 1px solid #ccc; margin: 1.6em 0; }
 img { max-width: 100%; height: auto; }
 """.strip()
 

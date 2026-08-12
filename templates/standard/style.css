@@ -442,3 +442,9 @@ pre.mermaid {
 pre.mermaid.mermaid-error {
   border-left: 4px solid var(--accent-2);
 }
+
+hr {
+  border: 0;
+  border-top: 1px solid var(--line);
+  margin: 2em 0;
+}
