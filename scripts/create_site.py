@@ -388,6 +388,7 @@ def render_embed(block: str, mode: str, state: dict, embed_start: int = 0, embed
         state["dropped"].add("audio")
     if "<video" in low:
         state["dropped"].add("video")
+        state["video"] = True
     if "<script" in low:
         state["dropped"].add("custom JavaScript")
     if "<iframe" in low:
@@ -435,7 +436,7 @@ def parse_markdown(markdown: str, mode: str = "site") -> tuple[str, list[dict[st
     out: list[str] = []
     toc: list[dict[str, str]] = []
     used_ids: set[str] = set()
-    state: dict = {"dropped": set(), "stepper": False, "embed": False, "mermaid": False}
+    state: dict = {"dropped": set(), "stepper": False, "embed": False, "mermaid": False, "video": False}
     # Edit-mode block identity is emitted only for the interactive site, never
     # the doc.html export (which must stay clean for the Google Docs path).
     editable = mode == "site"
@@ -673,6 +674,7 @@ def render_html(
     custom_js: list[str] | None = None,
     include_stepper: bool = False,
     include_mermaid: bool = False,
+    include_player: bool = False,
 ) -> str:
     generated = html.escape(str(manifest["generated_at"]))
     source_display = html.escape(str(source))
@@ -700,9 +702,12 @@ def render_html(
         f'\n  <link rel="stylesheet" href="./{html.escape(name, quote=True)}">'
         for name in (custom_css or [])
     )
+    player_css_link = '\n  <link rel="stylesheet" href="./review-player.css">' if include_player else ""
     scripts = ""
     if include_stepper:
         scripts += '\n    <script src="./stepper.js" defer></script>'
+    if include_player:
+        scripts += '\n    <script src="./review-player.js" defer></script>'
     if include_mermaid:
         # defer preserves order for classic scripts, so mermaid-init.js runs after
         # the library has defined window.mermaid.
@@ -723,7 +728,7 @@ def render_html(
   <title>{title_html}</title>
   <meta name="webdoc-version" content="{version_ns}">
   <link rel="icon" href="data:,">
-  <link rel="stylesheet" href="./style.css">{css_links}
+  <link rel="stylesheet" href="./style.css">{css_links}{player_css_link}
   <link rel="stylesheet" href="./edit.css">
 </head>
 <body data-webdoc-source="{source_name}">
@@ -950,10 +955,24 @@ def rebuild_html(source_path: str | Path, out_dir: str | Path) -> bool:
                     except OSError:
                         pass
 
+        include_player = bool(state.get("video"))
+        if include_player:
+            # Same never-raise contract as the mermaid copy above: a fresh
+            # <video> embed added via an edit must still get the player on
+            # this rebuild, not just on the next full create_site.py run.
+            for asset_name in ("review-player.js", "review-player.css"):
+                dest = out_dir / asset_name
+                if not dest.exists():
+                    try:
+                        shutil.copyfile(SKILL_DIR / "assets" / asset_name, dest)
+                    except OSError:
+                        pass
+
         page = render_html(
             title, source.resolve(), body_html, toc, manifest,
             custom_css=custom_css, custom_js=custom_js,
             include_stepper=bool(state.get("stepper")), include_mermaid=include_mermaid,
+            include_player=include_player,
         )
         doc_page = render_doc_html(title, doc_body)
 
@@ -1024,6 +1043,9 @@ def main() -> int:
     if state.get("mermaid"):
         shutil.copyfile(SKILL_DIR / "assets" / "mermaid.min.js", out_dir / "mermaid.min.js")
         shutil.copyfile(SKILL_DIR / "assets" / "mermaid-init.js", out_dir / "mermaid-init.js")
+    if state.get("video"):
+        shutil.copyfile(SKILL_DIR / "assets" / "review-player.js", out_dir / "review-player.js")
+        shutil.copyfile(SKILL_DIR / "assets" / "review-player.css", out_dir / "review-player.css")
     # Editing-mode + layout-audit assets, bundled into every site (index.html
     # links them; the doc.html export does not). Inert until served.
     shutil.copyfile(SKILL_DIR / "assets" / "edit.js", out_dir / "edit.js")
@@ -1073,6 +1095,7 @@ def main() -> int:
         title, source.resolve(), body_html, toc, manifest,
         custom_css=custom_css, custom_js=custom_js,
         include_stepper=bool(state.get("stepper")), include_mermaid=bool(state.get("mermaid")),
+        include_player=bool(state.get("video")),
     )
     doc_page = render_doc_html(title, doc_body)
 

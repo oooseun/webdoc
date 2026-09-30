@@ -22,12 +22,17 @@ Feedback closes the same loop. Leave notes on the page and they `POST` to a loca
 
 Diagrams are a first‑class output here, on a colorblind‑safe palette and a self‑contained offline embed contract: hand‑authored SVG when layout matters, pre‑rendered chart specs otherwise, click‑to‑step explanations for anything that changes over time (see `references/diagramming.md`). When a visual is worth getting right, generate five distinct concepts and review them on one gallery page: flip between them, pop any one out full‑screen, let your pick land back with the agent. Swap the whole look with `--template` (color, type, spacing). Save a look you like as a private, reusable category; a project or team then shares one consistent style.
 
-The finished site auto‑opens in your browser, unless you switch that off in `~/.config/webdoc/settings.json`. Everything stays on the machine: loopback binding, an OS‑assigned port, a finite TTL, a clean shutdown, no symlink escape.
+When taste decides between design directions, Smash or Pass (`scripts/smash_or_pass.py`) turns a folder of variants into a Tinder‑style deck: right arrow to smash, left to pass, type to attach a note. Votes land in `feedback.jsonl`, the agent reads what the smashes have in common, and the next round is dealt into the open page while you watch. Cards can also be plain questions, which makes the same deck a quick way to settle a list of open decisions.
+
+Drop a `<video>` into an embed and it becomes a review player: a real scrub bar, frame stepping, speed control, an A/B loop for replaying one cut, and `[m:ss]` timecodes in the text that jump the player there.
+
+The finished site auto‑opens in your browser, unless you switch that off in `~/.config/webdoc/settings.json`. On macOS it reuses the tab the site is already open in, so rebuilding and re‑serving never stacks up tabs. Everything stays on the machine: loopback binding, an OS‑assigned port, an idle shutdown once the last tab closes, a 7‑day TTL behind that, no symlink escape.
 
 ## Requirements
 
 - Python 3.8+ (standard library only, no pip install needed).
 - A modern browser to view served sites. Optional: `xdg-open` (Linux) or `open` (macOS) for auto‑open; falls back to Python's `webbrowser`.
+- Optional: Node 18+ to run the review player's JS tests.
 
 ## Install
 
@@ -54,10 +59,11 @@ python3 scripts/create_site.py report.md --template ./fashion-theme.css   # swap
 
 Each build also writes `doc.html` next to `index.html`. To get it into Google Docs, upload that file to Google Drive, then right‑click → Open with → Google Docs.
 
-Serve it locally (loopback only, auto‑assigned port, 2‑hour TTL; opens the browser unless `--no-open`):
+Serve it locally (loopback only, auto‑assigned port; opens the browser unless `--no-open`, and shuts down about 30 minutes after the last tab closes):
 
 ```bash
-python3 scripts/serve_site.py start ./report_site --ttl 7200
+python3 scripts/serve_site.py start ./report_site
+python3 scripts/serve_site.py start ./report_site --allow-lan   # let a phone on your LAN load it
 python3 scripts/serve_site.py status ./report_site
 python3 scripts/serve_site.py stop ./report_site
 ```
@@ -72,20 +78,23 @@ cat ./report_site/feedback.jsonl
 
 - `SKILL.md`: the full instruction set the agent follows: when to create vs. offer vs. skip, the decision matrix, the feedback rule, the visual‑explanation guidance, the quality bar.
 - `scripts/create_site.py`: Markdown/report → unified site (`index.html`) plus the self‑contained `doc.html` export; handles `stepper`/`embed` blocks, conditional‑format cells, `--css/--js/--asset` bundling.
-- `scripts/serve_site.py`: start/stop/inspect a localhost‑only preview server with durable `feedback.jsonl`, the editing‑mode write API, config‑driven auto‑open.
+- `scripts/serve_site.py`: start/stop/inspect a localhost‑only preview server with durable `feedback.jsonl`, the editing‑mode write API, HTTP range requests for video, config‑driven auto‑open with tab reuse.
 - `scripts/lint_prose.py`: the native, dependency‑free prose linter; run automatically as a build gate and also usable standalone (`python3 scripts/lint_prose.py file.md`, with `--warn-only` / `--json`). Rules in `lint/rules.json`.
 - `scripts/edit_support.py`: editing‑mode round‑trip: validate, hash‑check for drift, write the `.md` atomically, then maintain the override ledger (`check_overrides`, the anti‑clobber contract).
 - `scripts/html2md.py`: the strict, total HTML‑to‑Markdown whitelist converter used by the edit round‑trip.
 - `scripts/templates.py`: list built‑in templates and save a stylesheet as a private reusable category.
 - `scripts/gallery.py`: assemble a one‑page concept switcher over several built sites (the concept‑variations workflow).
+- `scripts/smash_or_pass.py`: build a Smash or Pass swipe deck from a `deck.json` of image or text cards.
+- `scripts/browser_tabs.py`: find, retarget or close the browser tab a site is open in (macOS AppleScript, time‑boxed, best‑effort).
 - `scripts/settings.py`: reads user config from `~/.config/webdoc/settings.json`.
-- `templates/standard/style.css`: the `standard` theme. `assets/stepper.js`: the click‑to‑step primitive. `assets/edit.js` and `assets/edit.css`: the in‑page editor, bundled into every site and inert until you click Edit.
+- `templates/standard/style.css`: the `standard` theme. `assets/stepper.js`: the click‑to‑step primitive. `assets/edit.js` and `assets/edit.css`: the in‑page editor, bundled into every site and inert until you click Edit. `assets/review-player.js` and `assets/review-player.css`: the video review player.
 - `references/avoid-ai-writing.md`: the full anti‑AI‑writing ruleset, applied to all generated prose.
 - `references/structural-tells.md`: the structural AI‑writing tells a wordlist misses, the counted second‑pass audit, the way the linter enforces them.
 - `references/diagramming.md`: the diagram and interactive‑visual system: palette, the offline embed contract, the stepper recipe, the render/verify gates.
+- `references/interactive-review-sites.md`: the recipe for single‑file review sites over a catalog of items (cards, search and filter, image lightbox, per‑item feedback).
 - `references/presenter-role.md`: role prompt for a narrow "presenter" subagent that lays out and verifies the site without touching the analysis.
 - `references/research-basis.md`: the research and source map the design is built on.
-- `tests/`: standard‑library test suites for the linter, the editing‑mode round‑trip, the write‑path guards. Run any with `python3 tests/<file>.py`.
+- `tests/`: standard‑library test suites for the linter, the editing‑mode round‑trip, the write‑path guards, server lifecycle, range serving, tab reuse and the review player. Run any with `python3 tests/<file>.py`; the player's JS tests run with `node --test tests/<file>.js`.
 - `agents/openai.yaml`: Codex skill interface metadata.
 
 ## Design principles

@@ -594,6 +594,39 @@ body:not(.webdoc-edit-on) .webdoc-lint {
   cursor: pointer;
 }
 
+/* Phones. The toggles are fixed at top-right, which is clear of the content
+   column on a desktop but lands directly on top of the first heading once the
+   column fills the viewport. Dock them to the bottom-right instead, where a
+   page's trailing whitespace is, and shrink them so the pair fits a 320px
+   screen. */
+@media screen and (max-width: 640px) {
+  .webdoc-edit-toggle,
+  .webdoc-ann-toggle {
+    top: auto;
+    bottom: 14px;
+    padding: 7px 11px;
+    font-size: 0.8rem;
+  }
+
+  .webdoc-edit-toggle {
+    right: 12px;
+  }
+
+  .webdoc-ann-toggle {
+    right: 78px;
+  }
+
+  /* The notice is a panel, not a button, so it keeps its own padding and just
+     moves clear of the toggles it would otherwise sit on. */
+  .webdoc-edit-notice {
+    top: auto;
+    bottom: 62px;
+    right: 12px;
+    left: 12px;
+    max-width: none;
+  }
+}
+
 @media print {
   .webdoc-edit-toggle,
   .webdoc-edit-banner,

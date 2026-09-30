@@ -167,6 +167,11 @@ code {
   background: var(--code-bg);
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 0.92em;
+  /* Inline code is how docs carry file paths and method signatures, which
+     are long unbreakable tokens. Without this a single identifier such as
+     PanelTabShortcut.target(at:pinboardIDs:) pushes the whole page into
+     horizontal scroll at phone width. */
+  overflow-wrap: anywhere;
 }
 
 pre {
@@ -176,10 +181,16 @@ pre {
   color: #eef5f2;
 }
 
+header code {
+  overflow-wrap: anywhere;
+}
+
 pre code {
   padding: 0;
   background: transparent;
   color: inherit;
+  /* Fenced blocks keep their own horizontal scroll and must not wrap. */
+  overflow-wrap: normal;
 }
 
 .table-wrap {
@@ -397,11 +408,14 @@ figure {
   margin: 0 0 1.1rem;
 }
 
+img {
+  max-width: 100%;
+  height: auto;
+}
+
 figure img,
 .gallery img {
   display: block;
-  max-width: 100%;
-  height: auto;
 }
 
 audio {

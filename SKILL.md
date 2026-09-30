@@ -139,6 +139,10 @@ flowchart TD
 
 The doc export runs no scripts, so there it shows the diagram source as a code block instead. When the diagram must appear in the Google Doc, pre-render it to SVG (see `references/diagramming.md`).
 
+**Video**: a bare `<video ...>` inside an embed is all you need. `create_site.py` detects it and bundles `review-player.js`/`review-player.css`, which turn every `<video>` on the page into a review player: a large surface sized to the content column, a real scrub bar with the buffered range, and keyboard transport (space play/pause, `←`/`→` seek 5s, `Shift+←`/`→` seek 1s, `,`/`.` step one frame at 29.97fps, `[`/`]` cycle speed 0.5-2x, `m` mute, `f` fullscreen, `i`/`o` set an A/B loop's in and out points, `l` toggle the loop, so a reviewer can replay one join over and over). Any `[m:ss]` or `[m:ss.f]` text on the page becomes a link that seeks the nearest preceding player and plays from there. Write those timecodes against the *embedded video's own* timeline; when the video is a sampler compiled from windows of a longer render, compute each window's offset in the sampler rather than reusing the render's timecodes. If the script fails to load, `<video controls>` keeps its native controls and still plays. Seeking local video relies on the server's HTTP Range support in `serve_site.py`.
+
+**Black or stuck video:** the player has a **Reload video** button that reloads the same media element and keeps position, playback state, speed and audio settings, with a 15-second timeout. Page notes and any external video listeners stay intact. It is a manual recovery, not a fix for whatever caused the blackout. Before using it, capture the picture, timestamp, media state and the exact served file; `readyState:4` and `error:null` do not prove a visible picture. A full page reload is the fallback, so save any unsent notes first.
+
 Never use looping CSS keyframes or GIFs for technical content. They are noisy and hard to read. A `stepper` is almost always the better tool.
 
 ## Concept Variations
@@ -175,6 +179,10 @@ Every build also writes a single self-contained `doc.html` (all CSS inline, no s
 
 Set `auto_open` to `false` to stop auto-opening. Per run, `--open` / `--no-open` override the config. Only loopback URLs are ever opened.
 
+**The user's everyday browser, never a testing one.** On macOS the URL goes to a pinned bundle (`open -b <bundle id>`, the registered http handler) instead of bare `open`. A testing build such as Chrome for Testing or plain Chromium is never accepted as that target, even if it registered itself as the handler; the everyday Google Chrome is used instead. Tab reuse ignores any browser whose only running instances were launched by a test harness (`--remote-debugging-*`, `--headless`, `--enable-automation`, a Playwright profile), because those instances answer AppleScript for the same app bundle and their tabs are not the user's.
+
+**One tab per site.** Showing a site never stacks up tabs. `start` first asks the running browsers (Chrome and its relatives, Safari) whether one of their tabs is already on this site, including a tab left on an earlier run's port, which gets retargeted to the new URL and focused. A new tab opens only when none exists. Serving a site that is already being served reuses its tab, and a restart keeps the previous port when it is free so an open tab stays live. When no browser can answer (none is running, automation permission is denied, or a headless automation copy answers instead of the user's), the site falls back to what it recorded in `tabs.json` and does not re-open a URL it opened within the last 8 hours; `--open` forces a fresh tab if the user closed theirs. `stop` closes the site's tab so nothing is left pointing at a dead port, and `--keep-tab` leaves it. Every browser call is time-boxed and best-effort: a browser that hangs or refuses costs a couple of seconds at most and never takes the server down.
+
 ## Templates
 
 A template is a complete stylesheet that swaps webdoc's look (color, type, spacing) without touching the content. Pick one with `--template`:
@@ -193,6 +201,31 @@ python3 scripts/templates.py list
 
 Saved categories live privately under `~/.config/webdoc/templates/<name>/` (never uploaded). Reuse one with `--template fashion-trends`; a team gets a cohesive look by copying that directory. Templates control theme only. Structural/layout templates are out of scope for now.
 
+## Smash or Pass (design triage decks)
+
+When the user is exploring a design direction (a new visual element, a style, a layout) and taste decides it, offer a **smash-or-pass deck** instead of a static gallery: generate about 10 to 20 genuinely distinct variants as images, build a Tinder-style swipe site, and read the votes back from durable storage. Offer it proactively; the user should not have to remember it exists.
+
+```bash
+# DECK_DIR: deck.json {"title","round","cards":[{"id","image","name","note"}]} + the images
+python3 scripts/smash_or_pass.py DECK_DIR --out SITE_DIR --title "..."
+python3 scripts/serve_site.py start SITE_DIR
+```
+
+- Controls: `→` smash, `←` pass. Typing any letter focuses the note box, and the note is saved with that card's swipe. Cmd/Ctrl+`→`/`←` swipes even mid-note, Cmd/Ctrl+Z undoes, Esc leaves the note. Votes append to the site's `feedback.jsonl` (`VOTE: smash|pass` + `NOTE:`); the latest vote per card wins, and a reload resumes mid-deck.
+- Cards are images by default. A card with `"text"` (plus an optional `"detail"`) in place of `"image"` renders as a text proposition, for decision or question decks where smash means yes and pass means no.
+- **The loop is the point.** Read the votes, work out what the smashes share and what the notes say, then generate the next round *toward* that pattern: append the new cards to `deck.json` and bump `"round"` while the server runs. The page polls every 5 seconds, shows a toast, and deals them in.
+- Slow generation: append `{"id":"__pending__","eta":"~2 min"}` so the end screen says the next round is coming instead of "done", and replace it with real cards when they are ready.
+- **Watch for the end of a round.** When the user finishes a round, the page POSTs a `__deck_complete__` sentinel (with the round number and tallies) into `feedback.jsonl`. Right after serving a deck, set up a watch on that file for the current round's sentinel (a file monitor, or whatever wake-up mechanism your agent harness offers) so the agent wakes to read the votes and build the next round. Without it, votes sit unread until the user complains.
+- Card images should be honest renders in real context (for example composited over an actual video frame), not idealized art. The vote is only as good as the mockup.
+
+## Asset Triage (audit existing placements)
+
+The sibling of Smash or Pass, for **auditing a batch of items that are already placed** (overlays on a timeline, staged b-roll) rather than exploring new directions. Show one card per item, **composited in its real context** (host frame plus overlay, never the bare asset), with a one-line rationale for why it was chosen, carousel-style.
+
+- Keyboard-only, and silence means consent: the right arrow advances and keeps anything without feedback, Enter accepts explicitly, and typed notes attach to the current item. Too much clicking is the failure this avoids.
+- Feedback persists per item to the site's durable storage for the agent to read, with the same `feedback.jsonl` and end-of-round sentinel rules as Smash or Pass.
+- There is no bundled script for this yet; build it on the Smash or Pass site as a starting point.
+
 ## Persistent Website Feedback
 
 Use the persisted-feedback pattern: the browser UI is not the source of truth; user actions POST to a localhost API and the server writes durable local state.
@@ -201,6 +234,7 @@ Use the persisted-feedback pattern: the browser UI is not the source of truth; u
 - When served with `scripts/serve_site.py`, `POST /api/feedback` appends to `feedback.jsonl` in the site directory.
 - The agent reads `feedback.jsonl` directly after the user submits feedback. The user should not copy/paste the feedback into chat.
 - Browser `localStorage`, unsent textarea contents, or DOM state are not durable enough.
+- A feedback script reused across rebuilds reads the build or version id from the page, never a constant, and refuses to post without one. Otherwise answers to a rebuilt page get filed under the old build.
 - For richer workflows, use SQLite or another explicit local store, but keep the same rule: website input must become agent-readable local state.
 
 ## Editing Mode
@@ -251,14 +285,18 @@ Prompting rules: state the question each visual answers before choosing a form; 
 ## Scripts
 
 - `scripts/create_site.py`: Convert a Markdown/report source into a unified static website (`index.html`, `style.css`, `manifest.json`, feedback UI) plus the self-contained `doc.html` export. Supports `stepper`/`embed` blocks, `[+]/[-]/[~]` table cells, `--template`, and `--css/--js/--asset` bundling.
-- `scripts/serve_site.py`: Start, stop, inspect, or clean up a localhost-only preview server with `server.json`, durable `feedback.jsonl`, config-driven auto-open, heartbeat-driven idle shutdown (default 30 minutes after the last tab closes), and a 7-day TTL backstop.
+- `scripts/serve_site.py`: Start, stop, inspect, or clean up a localhost-only preview server with `server.json`, durable `feedback.jsonl`, config-driven auto-open that reuses the site's existing tab, heartbeat-driven idle shutdown (default 30 minutes after the last tab closes), and a 7-day TTL backstop.
 - `scripts/templates.py`: List built-in templates and save a stylesheet as a private reusable category.
 - `scripts/gallery.py`: Assemble a concepts gallery (one switcher page over several built concept sites) for the Concept Variations workflow.
+- `scripts/smash_or_pass.py`: Build a Smash or Pass swipe deck from a `deck.json` of image or text cards; votes and notes land in `feedback.jsonl`.
+- `scripts/browser_tabs.py`: Find and reuse the browser tab a site is already open in (retargeting a tab left on an old port), or close it. Best-effort AppleScript on macOS, time-boxed, never launches a browser.
 - `scripts/settings.py`: Read user config from `~/.config/webdoc/settings.json`.
 - `scripts/lint_prose.py`: Native prose linter (no external binary, pure stdlib) that flags structural AI-writing tells. Run automatically by `create_site.py` as a build gate; also runnable standalone (`python3 scripts/lint_prose.py file.md`, with `--warn-only` / `--json` / `--no-lint`). Rules and severities live in `lint/rules.json`.
 - `scripts/edit_support.py`: Editing-mode server round-trip: `apply_edit(source_path, payload)` (validate, hash-check for drift, write the `.md` atomically), the override ledger, and `check_overrides` (the anti-clobber contract). Reuses `create_site`'s renderers so the page and the server never diverge.
 - `scripts/html2md.py`: Strict, total HTML→Markdown whitelist converter used by the edit round-trip (bold, italic, inline code, link, line break; anything else degrades to text). Importable; never throws.
 - `assets/edit.js`, `assets/edit.css`: The in-page editor, bundled into every site and inert until the reader clicks Edit. Linked from `index.html` only.
+- `assets/audit.js`: The client-side layout audit (overflow and overlap checks on the rendered page), bundled into every site and linked from `index.html` only. It posts findings to `/api/audit`, which lands them in `feedback.jsonl` for the agent.
+- `assets/review-player.js`, `assets/review-player.css`: The video review player, bundled automatically when a page embeds a `<video>`.
 
 Useful commands:
 
@@ -267,10 +305,11 @@ python3 scripts/create_site.py report.md
 python3 scripts/create_site.py report.md --out ./report_site --title "Research Report"
 python3 scripts/create_site.py report.md --css custom.css --js widget.js --asset clip.mp3
 python3 scripts/serve_site.py start ./report_site               # 7-day TTL, idle shutdown ~30 min after the last tab closes
+python3 scripts/serve_site.py start ./report_site --allow-lan --port 8788   # bind 0.0.0.0 so a phone on the LAN can load it; /api/edit stays loopback-only
 python3 scripts/serve_site.py start ./report_site --idle-timeout 0 --ttl 7200   # no idle shutdown, hard 2-hour TTL
 python3 scripts/serve_site.py start ./report_site --no-open
 python3 scripts/serve_site.py status ./report_site
-python3 scripts/serve_site.py stop ./report_site
+python3 scripts/serve_site.py stop ./report_site            # also closes the site's browser tab; --keep-tab leaves it
 ```
 
 ## Presenter Agent
@@ -295,5 +334,6 @@ No dedicated user-level `webdoc` subagent exists by default. If one is configure
 - `references/avoid-ai-writing.md`: Full Avoid AI Writing ruleset (verbatim, MIT, from conorbronsdon/avoid-ai-writing). Always apply it.
 - `references/structural-tells.md`: The structural tells the wordlist misses (negative parallelism, signposts, stacked negation, the "X of Y" aphorism), the enforced second-pass audit, and the native linter. Run the audit before serving.
 - `references/diagramming.md`: Diagrams and interactive visuals: Okabe-Ito style system, the offline scoped-embed contract, stepper recipe, build-with-subagents pattern, token-budget gotcha, and the render/verify gates. Read for any non-trivial diagram.
+- `references/interactive-review-sites.md`: The data-driven single-file review-site recipe for multi-item catalogs (embedded-JSON cards, search/sort/filter, the thumbnail and lightbox image pipeline with `images_manifest.json`, the hero-selection pattern, per-item structured feedback). Use it instead of the plain Markdown converter when the user scans and reacts item by item.
 - `references/presenter-role.md`: Prompt and constraints for a dedicated webdoc presenter agent.
 - `references/research-basis.md`: Research basis and official-doc source map.

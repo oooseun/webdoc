@@ -12,6 +12,7 @@ import math
 import os
 import re
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -28,6 +29,11 @@ except Exception:  # pragma: no cover - settings module should sit beside this f
         return {"auto_open": True}
 
 try:
+    import browser_tabs
+except Exception:  # pragma: no cover - tab reuse is best-effort; absence must not break serving
+    browser_tabs = None  # type: ignore[assignment]
+
+try:
     import edit_support
 except Exception:  # pragma: no cover - editing mode is optional; absence must not break serving
     edit_support = None  # type: ignore[assignment]
@@ -40,6 +46,27 @@ except Exception:  # pragma: no cover - rebuild-after-edit is best-effort; absen
 
 DEFAULT_ROOT = Path(os.environ.get("AGENT_ARTIFACT_SITES", "~/agent-artifacts/sites")).expanduser()
 LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+# A wildcard bind accepts connections on every interface but is not itself an
+# address anyone can open, so a site bound this way is reported under the LAN IP.
+WILDCARD_HOSTS = {"0.0.0.0", "::"}
+
+
+def lan_ip() -> str:
+    """This machine's LAN address, for a URL a phone can actually open.
+
+    Opens a UDP socket toward a TEST-NET-1 address to learn which local
+    interface would carry off-machine traffic. No packet is sent. Falls back to
+    loopback when there is no route out at all (offline, or Wi-Fi down), which
+    keeps the reported URL at least locally valid.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.connect(("192.0.2.1", 9))
+        return str(sock.getsockname()[0])
+    except OSError:
+        return "127.0.0.1"
+    finally:
+        sock.close()
 LOOPBACK_EDIT_MESSAGE = (
     "Editing is restricted to the local machine because it writes back to the "
     "source file. Open this site via 127.0.0.1 or localhost on the computer "
@@ -56,11 +83,22 @@ DEFAULT_TTL_SECONDS = 7 * 24 * 60 * 60
 DEFAULT_IDLE_TIMEOUT_SECONDS = 30 * 60
 WATCHDOG_POLL_SECONDS = 15
 IDLE_GRACE_SECONDS = 60
+# How many past URLs a site remembers for tab matching. A handful covers every
+# restart a review goes through; the list is only used to recognise stale tabs.
+TAB_URL_HISTORY = 8
+# How long after opening a tab we still assume it is on screen, used only when no
+# browser can be asked. A review session runs hours, not days.
+TAB_ASSUME_OPEN_SECONDS = 8 * 60 * 60
 MAX_FEEDBACK_BYTES = 64 * 1024
 MAX_EDIT_BYTES = 512 * 1024
 MAX_HEARTBEAT_BYTES = 4 * 1024
+# Larger than feedback: one flush batches up to 80 raw playback events (see
+# review-player.js's METRICS_CHUNK_SIZE) plus a summary, capped generously
+# here as a defensive backstop rather than the primary size control.
+MAX_METRICS_BYTES = 256 * 1024
 FEEDBACK_LOCK = threading.Lock()
 EDIT_LOCK = threading.Lock()
+METRICS_LOCK = threading.Lock()
 
 # Injected server-side into every served .html so old builds participate in idle
 # shutdown with no rebuild. One line, no dependencies, all errors swallowed:
@@ -120,6 +158,67 @@ def feedback_jsonl(site_dir: Path) -> Path:
     return site_dir / "feedback.jsonl"
 
 
+def metrics_jsonl(site_dir: Path) -> Path:
+    """Playback metrics live in their own file, never feedback.jsonl: that one
+    holds the user's review notes (verdicts, notes, decisions) and nothing else may
+    write to or delete it. Holds both client-reported player events (see
+    review-player.js's PlayerMetrics) and the server's own per-request Range
+    timing, distinguished by "source"."""
+    return site_dir / "metrics.jsonl"
+
+
+def tabs_json(site_dir: Path) -> Path:
+    """Which URLs this site has been opened on, so a later run can find the tab
+    it already has instead of opening another one."""
+    return site_dir / "tabs.json"
+
+
+def load_tab_state(site_dir: Path) -> dict:
+    try:
+        state = json.loads(tabs_json(site_dir).read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+    return state if isinstance(state, dict) else {}
+
+
+def record_tab_open(site_dir: Path, url: str, pid: int) -> None:
+    """Remember that a tab was put on this URL for this server process."""
+    state = load_tab_state(site_dir)
+    urls = [u for u in state.get("urls", []) if isinstance(u, str) and u != url]
+    urls.append(url)
+    state["urls"] = urls[-TAB_URL_HISTORY:]
+    state["last_url"] = url
+    state["last_pid"] = pid
+    state["last_opened_at"] = now_iso()
+    try:
+        tabs_json(site_dir).write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    except OSError:
+        pass
+
+
+def assume_tab_open(site_dir: Path, url: str, now: "float | None" = None) -> bool:
+    """Whether a tab for this exact URL is probably still on screen: we opened it
+    ourselves, recently enough that the review it belongs to is still going on.
+    Only consulted when no browser could be asked directly."""
+    state = load_tab_state(site_dir)
+    if state.get("last_url") != url:
+        return False
+    stamp = state.get("last_opened_at")
+    if not isinstance(stamp, str):
+        return False
+    try:
+        opened = datetime.fromisoformat(stamp).timestamp()
+    except ValueError:
+        return False
+    current = time.time() if now is None else now
+    return 0 <= current - opened <= TAB_ASSUME_OPEN_SECONDS
+
+
+def previous_urls(site_dir: Path, current: str) -> list[str]:
+    state = load_tab_state(site_dir)
+    return [u for u in state.get("urls", []) if isinstance(u, str) and u != current]
+
+
 def pid_alive(pid: int) -> bool:
     if pid <= 0:
         return False
@@ -155,6 +254,29 @@ def validate_site(site_dir: Path, allow_symlinks: bool = False) -> None:
 
 
 class NoListingHandler(http.server.SimpleHTTPRequestHandler):
+    # HTTP/1.1 + keep-alive. http.server's default is HTTP/1.0, which closes
+    # the TCP connection after every single response. A <video> element
+    # issues many sequential Range requests while seeking or buffering ahead;
+    # forcing a fresh TCP connection (and, behind tailscale serve, a fresh
+    # proxied one) for each request is the single biggest structural cause of
+    # "streaming is inconsistent" on a slower link. Safe to enable here
+    # because every response path in this handler already sends an explicit
+    # Content-Length, which is what HTTP/1.1 persistent connections require.
+    protocol_version = "HTTP/1.1"
+    # TCP_NODELAY. Without it, Nagle's algorithm can hold a small write
+    # (e.g. the response to a probe Range request) waiting to coalesce with
+    # the next one, interacting with the peer's delayed-ACK timer to add
+    # tens to hundreds of milliseconds of jitter — and it is exactly the
+    # small, latency-sensitive requests (seeks, range probes) that suffer.
+    # Bulk transfer throughput for the big chunks is unaffected.
+    disable_nagle_algorithm = True
+    # A defensive backstop now that connections stay open across requests:
+    # without a timeout, a connection abandoned mid-stream (phone locked or
+    # backgrounded) would otherwise pin a server thread indefinitely.
+    # http.server already treats socket.timeout as an orderly connection
+    # close (see BaseHTTPRequestHandler.handle_one_request).
+    timeout = 60
+
     def site_dir(self) -> Path:
         return Path(self.directory).resolve()
 
@@ -210,6 +332,8 @@ class NoListingHandler(http.server.SimpleHTTPRequestHandler):
             if html_file is not None:
                 self._serve_html_with_heartbeat(html_file)
                 return
+        if self._maybe_serve_range(head_only=False):
+            return
         super().do_GET()
 
     def do_HEAD(self) -> None:
@@ -222,6 +346,8 @@ class NoListingHandler(http.server.SimpleHTTPRequestHandler):
             if html_file is not None:
                 self._serve_html_with_heartbeat(html_file, head_only=True)
                 return
+        if self._maybe_serve_range(head_only=True):
+            return
         super().do_HEAD()
 
     def _peer_is_loopback(self) -> bool:
@@ -291,6 +417,8 @@ class NoListingHandler(http.server.SimpleHTTPRequestHandler):
             self.handle_undo()
         elif parsed.path == "/api/heartbeat":
             self.handle_heartbeat()
+        elif parsed.path == "/api/metrics":
+            self.handle_metrics()
         else:
             self.send_json(404, {"error": "not_found"})
 
@@ -322,6 +450,16 @@ class NoListingHandler(http.server.SimpleHTTPRequestHandler):
     def _append_feedback(self, entry: dict) -> Path:
         path = feedback_jsonl(self.site_dir())
         with FEEDBACK_LOCK:
+            with path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, sort_keys=True) + "\n")
+        return path
+
+    def _append_metrics(self, entry: dict) -> Path:
+        """The one and only write path into metrics.jsonl. Deliberately
+        separate from _append_feedback/FEEDBACK_LOCK: metrics must never share
+        a code path with feedback.jsonl, which holds the user's review notes."""
+        path = metrics_jsonl(self.site_dir())
+        with METRICS_LOCK:
             with path.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(entry, sort_keys=True) + "\n")
         return path
@@ -458,6 +596,126 @@ class NoListingHandler(http.server.SimpleHTTPRequestHandler):
         path = self._append_feedback(entry)
         self.send_json(200, {"ok": True, "count": len(findings), "feedback_path": str(path)})
 
+    # Client-reported field allowlists for /api/metrics, split by JSON type so
+    # a crafted or buggy client cannot inject arbitrary keys, oversized
+    # strings, or non-finite numbers (Infinity/NaN would serialize as bare
+    # tokens that break a strict JSON reader of metrics.jsonl) into the log.
+    _METRICS_INT_FIELDS = ("t", "readyState", "networkState", "errorCode")
+    _METRICS_FLOAT_FIELDS = ("currentTime", "duration", "playbackRate", "bufferedAhead", "bytes", "ms", "kbps")
+    _METRICS_SUMMARY_FIELDS = (
+        "rebufferCount", "rebufferMs", "stallCount", "firstPlayLatencyMs",
+        "lastPlayLatencyMs", "lastSeekLatencyMs", "throughputKbps", "bufferedAhead",
+    )
+
+    @staticmethod
+    def _clean_metrics_event(raw: object) -> "dict | None":
+        if not isinstance(raw, dict):
+            return None
+        etype = str(raw.get("type", ""))[:40]
+        if not etype:
+            return None
+        event: dict = {"type": etype}
+        for key in NoListingHandler._METRICS_INT_FIELDS:
+            if key not in raw or raw[key] is None:
+                continue
+            try:
+                value = float(raw[key])
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(value):
+                event[key] = int(value)
+        for key in NoListingHandler._METRICS_FLOAT_FIELDS:
+            if key not in raw or raw[key] is None:
+                continue
+            try:
+                value = float(raw[key])
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(value):
+                event[key] = round(value, 2)
+        if raw.get("errorMessage"):
+            event["errorMessage"] = str(raw["errorMessage"])[:200]
+        if isinstance(raw.get("paused"), bool):
+            event["paused"] = raw["paused"]
+        buffered = raw.get("buffered")
+        if isinstance(buffered, list):
+            ranges = []
+            for pair in buffered[:20]:
+                if not isinstance(pair, list) or len(pair) != 2:
+                    continue
+                try:
+                    a, b = float(pair[0]), float(pair[1])
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(a) and math.isfinite(b):
+                    ranges.append([round(a, 2), round(b, 2)])
+            event["buffered"] = ranges
+        return event
+
+    @staticmethod
+    def _clean_metrics_summary(raw: object) -> "dict | None":
+        if not isinstance(raw, dict):
+            return None
+        summary: dict = {}
+        for key in NoListingHandler._METRICS_SUMMARY_FIELDS:
+            if key not in raw or raw[key] is None:
+                continue
+            try:
+                value = float(raw[key])
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(value):
+                summary[key] = value
+        return summary or None
+
+    def handle_metrics(self) -> None:
+        """Batched client-side playback metrics (see review-player.js's
+        PlayerMetrics), appended to metrics.jsonl — never feedback.jsonl,
+        which holds the user's review notes and must only ever be written by the
+        feedback/audit endpoints above. One log line per raw event plus one
+        summary line per flush, so the file stays greppable by event type
+        without needing to reconstruct sessions to see the headline numbers."""
+        payload = self._read_json_body(MAX_METRICS_BYTES)
+        if payload is None:
+            return
+        raw_events = payload.get("events")
+        if not isinstance(raw_events, list):
+            self.send_json(400, {"error": "bad_events"})
+            return
+        session_id = str(payload.get("session_id", ""))[:64]
+        page = str(payload.get("page", ""))[:300]
+        video_id = str(payload.get("video_id", ""))[:100]
+        reason = str(payload.get("reason", ""))[:40]
+        user_agent = self.headers.get("user-agent", "")[:300]
+        received_at = now_iso()
+        common = {
+            "received_at": received_at,
+            "source": "client",
+            "session_id": session_id,
+            "page": page,
+            "video_id": video_id,
+            "user_agent": user_agent,
+        }
+
+        count = 0
+        for raw in raw_events[:500]:
+            event = self._clean_metrics_event(raw)
+            if event is None:
+                continue
+            event.update(common)
+            event["kind"] = "event"
+            self._append_metrics(event)
+            count += 1
+
+        summary = self._clean_metrics_summary(payload.get("summary"))
+        if summary is not None:
+            summary.update(common)
+            summary["kind"] = "summary"
+            summary["reason"] = reason
+            self._append_metrics(summary)
+
+        self.send_json(200, {"ok": True, "count": count})
+
     def _require_loopback_edit(self) -> bool:
         """Gate any write path on loopback: the real TCP peer first (unspoofable),
         then the Host header (DNS-rebinding defence). Both must be loopback even
@@ -569,7 +827,7 @@ class NoListingHandler(http.server.SimpleHTTPRequestHandler):
     # feedback, the manifest, and the edit ledger. *.edits.json is matched by
     # suffix. Page assets (index.html, doc.html, style.css, assets/*, the bundled
     # JS) are not in this set and keep serving.
-    _CONTROL_FILES = {"server.json", "server.log", "feedback.jsonl", "manifest.json"}
+    _CONTROL_FILES = {"server.json", "server.log", "feedback.jsonl", "manifest.json", "tabs.json", "metrics.jsonl"}
 
     def _forbidden_static_path(self, url_path: str) -> bool:
         """True when a GET/HEAD resolves to a control file or any dotfile/dot-dir,
@@ -640,12 +898,140 @@ class NoListingHandler(http.server.SimpleHTTPRequestHandler):
         if not head_only:
             self.wfile.write(body)
 
+    _RANGE_RE = re.compile(r"^bytes=(\d*)-(\d*)$")
+
+    def _maybe_serve_range(self, head_only: bool) -> bool:
+        """Serve a byte-range GET/HEAD when the client sent a Range header, so
+        <video>/<audio> seeking works at all. http.server has never supported
+        Range requests (a long-standing stdlib gap): without this, a Range:
+        request gets a 200 with the *entire* file body, which every browser
+        reads as "this server can't do partial content" and refuses to seek
+        for the rest of that media element's life, even via direct
+        currentTime assignment. Returns False (request untouched) for
+        anything that is not a satisfiable single-range request on an
+        existing static file; the caller falls through to the normal
+        full-file path, matching RFC 7233's instruction to ignore a
+        malformed or absent Range header rather than error on it."""
+        range_header = self.headers.get("Range")
+        if not range_header:
+            return False
+        match = self._RANGE_RE.match(range_header.strip())
+        if not match:
+            return False
+        path = Path(self.translate_path(self.path))
+        if not path.is_file():
+            return False
+        try:
+            size = path.stat().st_size
+            mtime = path.stat().st_mtime
+        except OSError:
+            return False
+
+        content_type = self.guess_type(str(path))
+        is_media = content_type.startswith(("video/", "audio/"))
+        url_path = self.path.split("?", 1)[0][:300]
+
+        start_s, end_s = match.groups()
+        if start_s == "":
+            if end_s == "":
+                return False  # "bytes=-" carries no range; fall back to a full GET
+            suffix_len = int(end_s)
+            if suffix_len <= 0:
+                return False
+            start, end = max(0, size - suffix_len), size - 1
+        else:
+            start = int(start_s)
+            end = int(end_s) if end_s != "" else size - 1
+
+        if size == 0 or start >= size or start > end:
+            self.send_response(416)
+            self.send_header("Content-Range", f"bytes */{size}")
+            # Framed empty body: under HTTP/1.1 keep-alive a client reads an
+            # unframed body until the connection closes.
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            if is_media:
+                self._log_range_request(url_path, f"{start_s}-{end_s}", size, 0, 0.0, 416, content_type, False)
+            return True
+
+        end = min(end, size - 1)
+        length = end - start + 1
+        self.send_response(206)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+        self.send_header("Content-Length", str(length))
+        self.send_header("Last-Modified", self.date_time_string(mtime))
+        self.end_headers()
+        if head_only:
+            if is_media:
+                self._log_range_request(url_path, f"{start}-{end}", size, 0, 0.0, 206, content_type, False)
+            return True
+        remaining = length
+        disconnected = False
+        t0 = time.monotonic()
+        try:
+            with path.open("rb") as f:
+                f.seek(start)
+                while remaining > 0:
+                    chunk = f.read(min(262144, remaining))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    remaining -= len(chunk)
+        except (BrokenPipeError, ConnectionResetError):
+            disconnected = True  # client disconnected mid-stream (a re-seek or closed tab); not an error
+        duration_s = time.monotonic() - t0
+        if is_media:
+            self._log_range_request(
+                url_path, f"{start}-{end}", size, length - remaining, duration_s, 206, content_type, disconnected
+            )
+        return True
+
+    def _log_range_request(self, url_path: str, byte_range: str, size: int, bytes_sent: int,
+                            duration_s: float, status: int, content_type: str, disconnected: bool) -> None:
+        """Server-side ground truth for a media Range request: path, range,
+        bytes actually sent, wall time, and client address — independent of
+        whatever the client's own Resource Timing can or can't see (WebKit's
+        coverage of that API for <video> sub-fetches is inconsistent).
+        Appended to metrics.jsonl next to the client-reported playback events
+        (same file; "source" distinguishes them). A logging failure must
+        never affect the response already sent to the client."""
+        try:
+            client = self.client_address[0] if getattr(self, "client_address", None) else ""
+        except (AttributeError, IndexError, TypeError):
+            client = ""
+        entry = {
+            "received_at": now_iso(),
+            "kind": "range_request",
+            "source": "server",
+            "path": url_path,
+            "range": byte_range,
+            "size": size,
+            "bytes_sent": bytes_sent,
+            "duration_ms": round(duration_s * 1000, 1),
+            "status": status,
+            "content_type": content_type,
+            "client": client,
+            "disconnected": disconnected,
+        }
+        try:
+            self._append_metrics(entry)
+        except Exception as exc:  # never let logging break a media response already sent
+            self.log_message("metrics log error: %r", exc)
+
     def list_directory(self, path: str):  # type: ignore[override]
         self.send_error(403, "Directory listing disabled")
         return None
 
     def end_headers(self) -> None:
         self.send_header("Cache-Control", "no-store")
+        if self.command in ("GET", "HEAD"):
+            # Advertise Range support on every static response, not only the
+            # ones already answering a Range request, so a client that checks
+            # Accept-Ranges before ever sending one still finds out this
+            # server supports it. _maybe_serve_range honors Range on any
+            # static file, so the header is true for every GET/HEAD response.
+            self.send_header("Accept-Ranges", "bytes")
         super().end_headers()
 
     def log_message(self, fmt: str, *args: object) -> None:
@@ -712,7 +1098,14 @@ def run_server(site_dir: Path, host: str, port: int, ttl: int, idle_timeout: flo
                idle_grace: float = IDLE_GRACE_SECONDS) -> int:
     validate_site(site_dir)
     handler = functools.partial(NoListingHandler, directory=str(site_dir))
-    httpd = ThreadingHTTPServer((host, port), handler)
+    try:
+        httpd = ThreadingHTTPServer((host, port), handler)
+    except OSError:
+        if port == 0:
+            raise
+        # The site's previous port was taken between the caller's check and this
+        # bind; an OS-assigned port still serves the site.
+        httpd = ThreadingHTTPServer((host, 0), handler)
     httpd.idle_shutdown_enabled = idle_timeout > 0
     actual_port = int(httpd.server_address[1])
     pid = os.getpid()
@@ -720,7 +1113,7 @@ def run_server(site_dir: Path, host: str, port: int, ttl: int, idle_timeout: flo
         "pid": pid,
         "host": host,
         "port": actual_port,
-        "url": f"http://{host}:{actual_port}/",
+        "url": f"http://{lan_ip() if host in WILDCARD_HOSTS else host}:{actual_port}/",
         "site_dir": str(site_dir),
         "started_at": now_iso(),
         "ttl_seconds": ttl,
@@ -773,7 +1166,13 @@ def run_server(site_dir: Path, host: str, port: int, ttl: int, idle_timeout: flo
 
 
 def open_url(url: str) -> bool:
-    """Open a URL in the default browser; best-effort, never raises."""
+    """Open a URL in the user's everyday browser; best-effort, never raises.
+
+    browser_tabs pins the target bundle so the preview cannot land in a testing
+    build; the loop below is the fallback for when that module is missing.
+    """
+    if browser_tabs is not None:
+        return browser_tabs.open_url(url)
     for cmd in (["open", url], ["xdg-open", url]):
         try:
             subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -788,16 +1187,67 @@ def open_url(url: str) -> bool:
         return False
 
 
-def start(site_dir: Path, host: str, port: int, ttl: int, idle_timeout: int, allow_lan: bool, allow_symlinks: bool, want_open: bool = False) -> int:
+def present_site(site_dir: Path, info: dict, forced: bool) -> str:
+    """Put the site in front of the user in at most one tab.
+
+    An existing tab for this site — including one left on a previous run's port —
+    is retargeted and focused rather than duplicated. When no browser can answer
+    (none scriptable is running, automation is denied, or the instance that
+    replied has no windows because a headless automation copy of the same browser
+    answered), fall back to what this site's own bookkeeping knows: if the tab
+    was opened on this exact URL for this exact server process, assume it is
+    still there and do not open a second one.
+    """
+    url = str(info.get("url") or "")
+    if not url:
+        return "no-url"
+    pid = int(info.get("pid", -1))
+    outcome = browser_tabs.reuse_tab(url, previous_urls(site_dir, url)) if browser_tabs else "unavailable"
+    if outcome == "reused":
+        record_tab_open(site_dir, url, pid)
+        return "reused"
+    if outcome == "unavailable" and not forced and assume_tab_open(site_dir, url):
+        return "already-open"
+    open_url(url)
+    record_tab_open(site_dir, url, pid)
+    return "opened"
+
+
+def free_port(host: str, port: int) -> bool:
+    """Whether this port can be bound right now, so a restart can keep the URL
+    the user already has a tab on."""
+    if port <= 0:
+        return False
+    import socket
+
+    with socket.socket(socket.AF_INET6 if ":" in host else socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind((host, port))
+        except OSError:
+            return False
+    return True
+
+
+def start(site_dir: Path, host: str, port: int, ttl: int, idle_timeout: int, allow_lan: bool, allow_symlinks: bool, want_open: bool = False, forced_open: bool = False) -> int:
     if host not in LOOPBACK_HOSTS and not allow_lan:
         raise SystemExit("refusing non-loopback host without --allow-lan")
     validate_site(site_dir, allow_symlinks=allow_symlinks)
     info = load_server_info(site_dir)
     if info and pid_alive(int(info.get("pid", -1))) and str(info.get("site_dir")) == str(site_dir):
-        if want_open and host in LOOPBACK_HOSTS and info.get("url"):
-            open_url(str(info["url"]))
+        if want_open and host in LOOPBACK_HOSTS | WILDCARD_HOSTS and info.get("url"):
+            info = dict(info)
+            info["opened"] = present_site(site_dir, info, forced_open)
         print(json.dumps(info, indent=2, sort_keys=True))
         return 0
+
+    # Keep the port the site last used when it is free: the URL stays stable
+    # across restarts, so an open tab still points at a live server and can be
+    # reloaded instead of abandoned.
+    if port == 0 and info and str(info.get("site_dir")) == str(site_dir):
+        previous = int(info.get("port", 0) or 0)
+        if free_port(host, previous):
+            port = previous
 
     try:
         server_json(site_dir).unlink()
@@ -832,8 +1282,9 @@ def start(site_dir: Path, host: str, port: int, ttl: int, idle_timeout: int, all
     while time.time() < deadline:
         info = load_server_info(site_dir)
         if info and int(info.get("pid", -1)) == child.pid:
-            if want_open and host in LOOPBACK_HOSTS and info.get("url"):
-                open_url(str(info["url"]))
+            if want_open and host in LOOPBACK_HOSTS | WILDCARD_HOSTS and info.get("url"):
+                info = dict(info)
+                info["opened"] = present_site(site_dir, info, forced_open)
             print(json.dumps(info, indent=2, sort_keys=True))
             return 0
         if child.poll() is not None:
@@ -842,8 +1293,32 @@ def start(site_dir: Path, host: str, port: int, ttl: int, idle_timeout: int, all
     raise SystemExit(f"server did not report readiness; see {site_dir / 'server.log'}")
 
 
-def stop(site_dir: Path, quiet: bool = False) -> int:
+def close_site_tabs(site_dir: Path, info: "dict | None") -> int:
+    """Close the tabs this site left behind, so stopping a server does not leave
+    a tab pointing at a dead port. Best-effort and silent on failure."""
+    if browser_tabs is None:
+        return 0
+    urls = previous_urls(site_dir, "")
+    current = str((info or {}).get("url") or "")
+    if current and current not in urls:
+        urls.append(current)
+    closed = browser_tabs.close_tabs(urls) if urls else 0
+    if closed:
+        state = load_tab_state(site_dir)
+        state.pop("last_url", None)
+        state.pop("last_pid", None)
+        state.pop("last_opened_at", None)
+        try:
+            tabs_json(site_dir).write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        except OSError:
+            pass
+    return closed
+
+
+def stop(site_dir: Path, quiet: bool = False, close_tab: bool = True) -> int:
     info = load_server_info(site_dir)
+    if close_tab:
+        close_site_tabs(site_dir, info)
     if not info:
         if not quiet:
             print(json.dumps({"status": "not-running", "site_dir": str(site_dir)}, indent=2))
@@ -910,17 +1385,18 @@ def main() -> int:
 
     p_start = sub.add_parser("start", help="Start serving a site directory")
     p_start.add_argument("site")
-    p_start.add_argument("--host", default="127.0.0.1")
+    p_start.add_argument("--host", default=None, help="Bind address. Defaults to 127.0.0.1, or 0.0.0.0 when --allow-lan is given so the site is genuinely reachable at that name")
     p_start.add_argument("--port", type=int, default=0, help="0 lets the OS choose an unused port")
     p_start.add_argument("--ttl", type=int, default=DEFAULT_TTL_SECONDS, help="Seconds before the TTL backstop shuts the server down (default 7 days); 0 disables TTL")
     p_start.add_argument("--idle-timeout", type=int, default=DEFAULT_IDLE_TIMEOUT_SECONDS, help="Seconds of no requests before idle shutdown (default 30 min); the served page's heartbeat keeps an open tab alive, so this fires after the last tab goes away. 0 disables idle shutdown")
-    p_start.add_argument("--allow-lan", action="store_true")
+    p_start.add_argument("--allow-lan", action="store_true", help="Serve other devices on the LAN by binding 0.0.0.0; ignored when --host is passed explicitly. Write APIs such as /api/edit stay loopback-only regardless")
     p_start.add_argument("--allow-symlinks", action="store_true")
-    p_start.add_argument("--open", dest="open", action="store_true", help="Open the site in the browser after start (overrides config)")
+    p_start.add_argument("--open", dest="open", action="store_true", help="Show the site in the browser after start (overrides config); reuses the site's existing tab, and opens one even if this site was already shown")
     p_start.add_argument("--no-open", dest="no_open", action="store_true", help="Do not open the browser after start (overrides config)")
 
     p_stop = sub.add_parser("stop", help="Stop a managed server for a site directory")
     p_stop.add_argument("site")
+    p_stop.add_argument("--keep-tab", action="store_true", help="Leave the site's browser tab open instead of closing it")
 
     p_status = sub.add_parser("status", help="Show managed server status for a site directory")
     p_status.add_argument("site")
@@ -943,9 +1419,13 @@ def main() -> int:
             want_open = False
         elif args.open:
             want_open = True
-        return start(resolve_site(args.site), args.host, args.port, args.ttl, args.idle_timeout, args.allow_lan, args.allow_symlinks, want_open=want_open)
+        # --allow-lan is a guard on non-loopback hosts, so on its own it left the
+        # server on loopback and a "LAN" URL that only worked locally. Make the
+        # flag bind the LAN it names, while an explicit --host still wins.
+        host = args.host or ("0.0.0.0" if args.allow_lan else "127.0.0.1")
+        return start(resolve_site(args.site), host, args.port, args.ttl, args.idle_timeout, args.allow_lan, args.allow_symlinks, want_open=want_open, forced_open=bool(args.open))
     if args.command == "stop":
-        return stop(resolve_site(args.site))
+        return stop(resolve_site(args.site), close_tab=not args.keep_tab)
     if args.command == "status":
         return status(resolve_site(args.site))
     if args.command == "cleanup":
